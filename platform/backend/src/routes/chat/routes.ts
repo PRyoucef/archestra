@@ -34,6 +34,7 @@ import {
   isApiKeyRequired,
 } from "@/clients/llm-client";
 import config from "@/config";
+import db from "@/database";
 import { browserStreamFeature } from "@/features/browser-stream/services/browser-stream.feature";
 import { extractAndIngestDocuments } from "@/knowledge-base";
 import logger from "@/logging";
@@ -65,6 +66,7 @@ import {
   DeleteObjectResponseSchema,
   ErrorResponsesSchema,
   InsertConversationSchema,
+  SelectConversationCompactionSchema,
   SelectConversationSchema,
   SelectConversationShareWithTargetsSchema,
   type UpdateConversation,
@@ -78,6 +80,11 @@ import {
   resolveFastModelName,
 } from "@/utils/llm-resolution";
 import { estimateMessagesSize } from "@/utils/message-size";
+import {
+  buildContextCompactionStreamData,
+  compactMessagesForChat,
+  invalidateConversationCompactions,
+} from "./context-compaction";
 import {
   parseMaxInputTokens,
   shouldProbeTextStreamForContextTrimRetry,
@@ -321,45 +328,10 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
           const normalizedMessagesForLLM = normalizeChatMessages(
             messages as ChatMessage[],
           );
-          const providerPreparedMessages = prepareMessagesForProvider({
-            messages: normalizedMessagesForLLM,
-            provider,
-          });
-
-          // Stream with AI SDK
-          // Build streamText config conditionally
-          // Cast to UIMessage[] - ChatMessage is structurally compatible at runtime
-          const modelMessages = await convertToModelMessages(
-            providerPreparedMessages as unknown as Omit<UIMessage, "id">[],
-          );
 
           // Perplexity does NOT support tool calling - it has built-in web search instead
           // @see https://docs.perplexity.ai/api-reference/chat-completions-post
           const supportsToolCalling = provider !== "perplexity";
-
-          const streamTextConfig: Parameters<typeof streamText>[0] = {
-            model,
-            messages: modelMessages,
-            ...(supportsToolCalling && { tools: mcpTools }),
-            stopWhen: buildChatStopConditions(),
-            abortSignal: chatAbortController.signal,
-            onFinish: async ({ usage, finishReason }) => {
-              removeAbortListeners();
-              logger.info(
-                {
-                  conversationId,
-                  usage,
-                  finishReason,
-                },
-                "Chat stream finished",
-              );
-            },
-          };
-
-          // Only include system property if we have actual content
-          if (systemPrompt) {
-            streamTextConfig.system = systemPrompt;
-          }
 
           // For Gemini image generation models, enable image output via responseModalities
           // Known image-capable model patterns:
@@ -378,13 +350,6 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
             provider === "gemini" &&
             (modelLower.includes("image") ||
               modelLower.includes("native-audio-dialog"));
-          if (isGeminiImageModel) {
-            streamTextConfig.providerOptions = {
-              google: {
-                responseModalities: ["TEXT", "IMAGE"],
-              },
-            };
-          }
 
           // Persist user's new messages immediately so they're visible on page reload.
           // Without this, a reload during streaming shows no messages because
@@ -547,7 +512,9 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
 
                 // Emit data-tool-ui-start synchronously in onChunk so it
                 // arrives right after tool-input-start, before any deltas.
-                streamTextConfig.onChunk = ({ chunk }) => {
+                const streamTextOnChunk: NonNullable<
+                  Parameters<typeof streamText>[0]["onChunk"]
+                > = ({ chunk }) => {
                   if (chunk.type === "tool-input-start" && chunk.toolName) {
                     const prefetched = prefetchedUiResources.get(
                       chunk.toolName,
@@ -568,22 +535,74 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                   }
                 };
 
-                // ⚠️ TEMPORARY: Error injection for testing retries. Remove after testing.
-                const lastMsg = (
-                  messages as { parts?: { type: string; text?: string }[] }[]
-                ).at(-1);
-                const lastText =
-                  lastMsg?.parts?.find((p) => p.type === "text")?.text ?? "";
-                if (lastText.includes("__test_500")) {
-                  throw new Error("Simulated server error (500)");
+                let compactionStarted = false;
+                const compactionResult = await compactMessagesForChat({
+                  conversationId,
+                  organizationId,
+                  userId: user.id,
+                  agentId: conversation.agentId,
+                  provider,
+                  selectedModel: conversation.selectedModel,
+                  agentLlmApiKeyId: agent.llmApiKeyId,
+                  messages: normalizedMessagesForLLM,
+                  systemPrompt,
+                  trigger: "auto",
+                  abortSignal: chatAbortController.signal,
+                  onCompactionStart: () => {
+                    compactionStarted = true;
+                    writer.write({
+                      type: "data-context-compaction-start",
+                      data: { trigger: "auto" },
+                    });
+                  },
+                });
+
+                if (
+                  compactionStarted ||
+                  compactionResult.status === "created" ||
+                  compactionResult.status === "failed"
+                ) {
+                  writer.write({
+                    type: "data-context-compaction-finish",
+                    data: buildContextCompactionStreamData(compactionResult),
+                  });
                 }
-                if (lastText.includes("__test_network")) {
-                  throw new TypeError("Failed to fetch");
+
+                const modelMessages = await buildModelMessagesForProvider({
+                  messages: compactionResult.messages,
+                  provider,
+                });
+                const streamTextConfig: Parameters<typeof streamText>[0] = {
+                  model,
+                  messages: modelMessages,
+                  ...(supportsToolCalling && { tools: mcpTools }),
+                  stopWhen: buildChatStopConditions(),
+                  abortSignal: chatAbortController.signal,
+                  onChunk: streamTextOnChunk,
+                  onFinish: async ({ usage, finishReason }) => {
+                    removeAbortListeners();
+                    logger.info(
+                      {
+                        conversationId,
+                        usage,
+                        finishReason,
+                      },
+                      "Chat stream finished",
+                    );
+                  },
+                };
+
+                // Only include system property if we have actual content
+                if (systemPrompt) {
+                  streamTextConfig.system = systemPrompt;
                 }
-                if (lastText.includes("__test_no_output")) {
-                  throw new Error(
-                    "No output generated. Check the stream for errors.",
-                  );
+
+                if (isGeminiImageModel) {
+                  streamTextConfig.providerOptions = {
+                    google: {
+                      responseModalities: ["TEXT", "IMAGE"],
+                    },
+                  };
                 }
 
                 // Stream tokens to the client in real-time while also
@@ -1247,6 +1266,82 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
     },
   );
 
+  fastify.post(
+    "/api/chat/conversations/:id/compact",
+    {
+      schema: {
+        operationId: RouteId.CompactChatConversation,
+        description: "Compact older chat history for model context",
+        tags: ["Chat"],
+        params: z.object({ id: UuidIdSchema }),
+        response: constructResponseSchema(
+          z.object({
+            status: z.enum(["created", "existing", "skipped", "failed"]),
+            reason: z.string().optional(),
+            compaction: SelectConversationCompactionSchema.nullable(),
+            conversation: SelectConversationSchema,
+          }),
+        ),
+      },
+    },
+    async ({ params: { id }, user, organizationId }, reply) => {
+      const conversation = await ConversationModel.findById({
+        id,
+        userId: user.id,
+        organizationId,
+      });
+
+      if (!conversation) {
+        throw new ApiError(404, "Conversation not found");
+      }
+
+      if (!conversation.agentId || !conversation.agent) {
+        throw new ApiError(
+          400,
+          "The agent associated with this conversation has been deleted",
+        );
+      }
+
+      // Resolve the conversation's stored model_id FK to the proxy-facing
+      // model string + provider (env/config fallback if unset). Mirrors the
+      // chat-stream route's resolution so compaction sees the same model.
+      const { model: selectedModel, provider } = await resolveConversationModel(
+        conversation.modelId,
+      );
+      const normalizedMessages = normalizeChatMessages(
+        conversation.messages as ChatMessage[],
+      );
+      const result = await compactMessagesForChat({
+        conversationId: id,
+        organizationId,
+        userId: user.id,
+        agentId: conversation.agentId,
+        provider,
+        selectedModel,
+        agentLlmApiKeyId: conversation.agent.llmApiKeyId,
+        messages: normalizedMessages,
+        systemPrompt: conversation.agent.systemPrompt ?? undefined,
+        trigger: "manual",
+      });
+      const updatedConversation = await ConversationModel.findById({
+        id,
+        userId: user.id,
+        organizationId,
+      });
+
+      if (!updatedConversation) {
+        throw new ApiError(500, "Failed to retrieve compacted conversation");
+      }
+
+      return reply.send({
+        status: result.status,
+        reason: result.reason,
+        compaction: result.compaction,
+        conversation: updatedConversation,
+      });
+    },
+  );
+
   fastify.get(
     "/api/chat/conversations/:id/share",
     {
@@ -1647,16 +1742,19 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
         throw new ApiError(404, "Message not found or access denied");
       }
 
-      // Update the message and optionally delete subsequent messages atomically
-      // Using a transaction ensures both operations succeed or fail together,
-      // preventing inconsistent state where message is updated but subsequent
-      // messages remain when they should have been deleted
-      await MessageModel.updateTextPartAndDeleteSubsequent(
-        message.id,
-        partIndex,
-        text,
-        deleteSubsequentMessages ?? false,
-      );
+      // run the message edit, optional subsequent-message deletion, and
+      // compaction invalidation inside one transaction so a crash can't leave
+      // stale compactions pointing at a now-edited or truncated history
+      await db.transaction(async (tx) => {
+        await MessageModel.updateTextPartAndDeleteSubsequent(
+          message.id,
+          partIndex,
+          text,
+          deleteSubsequentMessages ?? false,
+          tx,
+        );
+        await invalidateConversationCompactions(message.conversationId, tx);
+      });
 
       // Return updated conversation with all messages
       const updatedConversation = await ConversationModel.findById({
@@ -2077,32 +2175,79 @@ function getMessagesNotYetPersisted(params: {
   const existingIds = new Set<string>();
 
   for (const message of params.existingMessages) {
-    existingIds.add(message.id);
-
-    // Persisted messages are re-keyed to DB UUIDs when conversations reload, but
-    // in-flight useChat requests can still carry the original temporary content
-    // ids. Track both forms so follow-up turns after swap_agent do not get
-    // dropped just because the incoming thread is shorter than the DB thread.
-    const contentId =
-      typeof message.content === "object" &&
-      message.content !== null &&
-      "id" in message.content &&
-      typeof message.content.id === "string"
-        ? message.content.id
-        : null;
-
-    if (contentId) {
-      existingIds.add(contentId);
+    for (const id of getPersistedMessageIdentityIds(message)) {
+      existingIds.add(id);
     }
   }
 
   return params.uiMessages.filter((message) => {
-    if (!message.id || typeof message.id !== "string") {
+    const messageIds = getUiMessageIdentityIds(message);
+    if (messageIds.length === 0) {
       return true;
     }
 
-    return !existingIds.has(message.id);
+    return messageIds.every((id) => !existingIds.has(id));
   });
+}
+
+function getPersistedMessageIdentityIds(message: {
+  id: string;
+  content: unknown;
+}): string[] {
+  const ids = new Set<string>();
+  if (message.id) {
+    ids.add(message.id);
+  }
+
+  const contentId = getContentMessageId(message.content);
+  if (contentId) {
+    ids.add(contentId);
+  }
+
+  return [...ids];
+}
+
+function getUiMessageIdentityIds(message: ChatMessage): string[] {
+  const ids = new Set<string>();
+  if (message.id && typeof message.id === "string") {
+    ids.add(message.id);
+  }
+
+  const persistedMessageId = getMessagePersistedMetadataId(message);
+  if (persistedMessageId) {
+    ids.add(persistedMessageId);
+  }
+
+  return [...ids];
+}
+
+function getContentMessageId(content: unknown): string | null {
+  if (
+    typeof content === "object" &&
+    content !== null &&
+    "id" in content &&
+    typeof content.id === "string" &&
+    content.id.length > 0
+  ) {
+    return content.id;
+  }
+
+  return null;
+}
+
+function getMessagePersistedMetadataId(message: ChatMessage): string | null {
+  if (
+    !("metadata" in message) ||
+    typeof message.metadata !== "object" ||
+    message.metadata === null ||
+    !("persistedMessageId" in message.metadata) ||
+    typeof message.metadata.persistedMessageId !== "string" ||
+    message.metadata.persistedMessageId.length === 0
+  ) {
+    return null;
+  }
+
+  return message.metadata.persistedMessageId;
 }
 
 function prepareMessagesForProvider(params: {
@@ -2124,6 +2269,18 @@ function prepareMessagesForProvider(params: {
   }
 
   return messages;
+}
+
+async function buildModelMessagesForProvider(params: {
+  messages: ChatMessage[];
+  provider: SupportedProvider;
+}) {
+  const providerPreparedMessages = prepareMessagesForProvider(params);
+
+  // Cast to UIMessage[] - ChatMessage is structurally compatible at runtime.
+  return await convertToModelMessages(
+    providerPreparedMessages as unknown as Omit<UIMessage, "id">[],
+  );
 }
 
 function normalizeAnthropicMessageFileParts(message: ChatMessage): ChatMessage {

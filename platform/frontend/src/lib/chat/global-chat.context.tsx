@@ -57,6 +57,23 @@ const RETRYABLE_CLIENT_ERRORS = [
   "network",
 ];
 
+export type ContextCompactionState = {
+  isCompacting: boolean;
+  trigger: "auto" | "manual" | null;
+  lastCompaction: {
+    trigger?: "auto" | "manual";
+    compactionId?: string;
+    originalTokenEstimate?: number;
+    compactedTokenEstimate?: number;
+  } | null;
+};
+
+type ContextCompactionRecord = NonNullable<
+  ContextCompactionState["lastCompaction"]
+> & {
+  updateContextTokens?: boolean;
+};
+
 function isRetryableError(error: Error): boolean {
   const msg = error.message;
   // Structured backend chat errors already reached the server and should render
@@ -99,6 +116,9 @@ interface ChatSession {
   ) => void;
   /** Token usage for the current/last response */
   tokenUsage: TokenUsage | null;
+  contextTokensUsed: number | null;
+  contextCompaction: ContextCompactionState;
+  recordContextCompaction: (compaction: ContextCompactionRecord) => void;
   /** Early UI data from data-tool-ui-start events (toolCallId → resource data incl. pre-fetched HTML) */
   earlyToolUiStarts: Record<
     string,
@@ -325,6 +345,15 @@ function ChatSessionHook({
     }>
   >([]);
   const [tokenUsage, setTokenUsage] = useState<TokenUsage | null>(null);
+  const [contextTokensUsed, setContextTokensUsed] = useState<number | null>(
+    null,
+  );
+  const [contextCompaction, setContextCompaction] =
+    useState<ContextCompactionState>({
+      isCompacting: false,
+      trigger: null,
+      lastCompaction: null,
+    });
   const generateTitleMutation = useGenerateConversationTitle();
   // Read from the shared TanStack cache so we only auto-title untitled chats
   const { data: conversation } = useConversation(conversationId);
@@ -345,6 +374,25 @@ function ChatSessionHook({
   const retryTimerRef = useRef<NodeJS.Timeout | null>(null);
   const lastUserMessageIdRef = useRef<string | null>(null);
   const previousMessagesRef = useRef<UIMessage[]>([]);
+
+  const recordContextCompaction = useCallback(
+    (compaction: ContextCompactionRecord) => {
+      const { updateContextTokens = true, ...lastCompaction } = compaction;
+      setContextCompaction({
+        isCompacting: false,
+        trigger: null,
+        lastCompaction,
+      });
+
+      if (
+        updateContextTokens &&
+        typeof lastCompaction.compactedTokenEstimate === "number"
+      ) {
+        setContextTokensUsed(lastCompaction.compactedTokenEstimate);
+      }
+    },
+    [],
+  );
 
   // Track early UI data from data-tool-ui-start events (toolCallId → resource data)
   const [earlyToolUiStarts, setEarlyToolUiStarts] = useState<
@@ -510,6 +558,34 @@ function ChatSessionHook({
       if (dataPart.type === "data-token-usage") {
         const usage = dataPart.data as TokenUsage;
         setTokenUsage(usage);
+        if (typeof usage.totalTokens === "number") {
+          setContextTokensUsed(usage.totalTokens);
+        }
+      }
+
+      if (dataPart.type === "data-context-compaction-start") {
+        const data = dataPart.data as { trigger?: "auto" | "manual" };
+        setContextCompaction((current) => ({
+          ...current,
+          isCompacting: true,
+          trigger: data.trigger ?? "auto",
+        }));
+      }
+
+      if (dataPart.type === "data-context-compaction-finish") {
+        const data = dataPart.data as {
+          trigger?: "auto" | "manual";
+          compactionId?: string;
+          originalTokenEstimate?: number;
+          compactedTokenEstimate?: number;
+        };
+        recordContextCompaction({
+          ...data,
+          updateContextTokens: data.trigger !== "auto",
+        });
+        queryClient.invalidateQueries({
+          queryKey: ["conversation", conversationId],
+        });
       }
 
       // Handle data-tool-ui-start: backend emits this when a tool call starts streaming,
@@ -633,6 +709,9 @@ function ChatSessionHook({
     optimisticToolCalls,
     setPendingCustomServerToolCall,
     tokenUsage,
+    contextTokensUsed,
+    contextCompaction,
+    recordContextCompaction,
     earlyToolUiStarts,
   };
 
@@ -656,6 +735,9 @@ function ChatSessionHook({
     pendingCustomServerToolCall,
     optimisticToolCalls,
     tokenUsage,
+    contextTokensUsed,
+    contextCompaction,
+    recordContextCompaction,
     earlyToolUiStarts,
     sessionsRef,
     notifySessionUpdate,

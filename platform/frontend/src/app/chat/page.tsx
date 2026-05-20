@@ -94,6 +94,7 @@ import {
 import { useRecentlyGeneratedTitles } from "@/lib/chat/chat.hook";
 import {
   fetchConversationEnabledTools,
+  useCompactConversation,
   useConversation,
   useCreateConversation,
   useHasPlaywrightMcpTools,
@@ -112,6 +113,8 @@ import {
 import {
   conversationStorageKeys,
   getConversationDisplayTitle,
+  getManualCompactionSkippedMessage,
+  mergePersistedMessageMetadata,
 } from "@/lib/chat/chat-utils";
 import { useChatSession } from "@/lib/chat/global-chat.context";
 import {
@@ -203,6 +206,10 @@ export function ChatPageContent({
   const [isShareDialogOpen, setIsShareDialogOpen] = useState(false);
   const [isForkDialogOpen, setIsForkDialogOpen] = useState(false);
   const [forkAgentId, setForkAgentId] = useState<string | null>(null);
+  const [manualCompactionFeedback, setManualCompactionFeedback] = useState<{
+    status: "pending" | "success" | "skipped" | "failed";
+    message: string;
+  } | null>(null);
   const forkConversationMutation = useForkConversation();
   const forkSharedConversationMutation = useForkSharedConversation();
   const { data: session } = useSession();
@@ -843,6 +850,7 @@ export function ChatPageContent({
 
   // Stop chat stream mutation (signals backend to abort subagents)
   const stopChatStreamMutation = useStopChatStream();
+  const compactConversationMutation = useCompactConversation();
 
   // Persist artifact panel state
   const toggleArtifactPanel = useCallback(() => {
@@ -913,6 +921,37 @@ export function ChatPageContent({
   const setPendingCustomServerToolCall =
     chatSession?.setPendingCustomServerToolCall;
   const tokenUsage = chatSession?.tokenUsage;
+  const contextTokensUsed = chatSession?.contextTokensUsed;
+  const contextCompaction = chatSession?.contextCompaction;
+  const recordContextCompaction = chatSession?.recordContextCompaction;
+
+  const syncPersistedMessageMetadata = useCallback(
+    (persistedMessages: UIMessage[]) => {
+      if (!chatSession?.messages || !setMessages) {
+        return;
+      }
+
+      const mergedMessages = mergePersistedMessageMetadata({
+        liveMessages: chatSession.messages,
+        persistedMessages,
+      });
+
+      if (mergedMessages === chatSession.messages) {
+        return;
+      }
+
+      setMessages(mergedMessages);
+    },
+    [chatSession?.messages, setMessages],
+  );
+
+  useEffect(() => {
+    if (status !== "ready") {
+      return;
+    }
+
+    syncPersistedMessageMetadata(persistedConversationMessages);
+  }, [persistedConversationMessages, status, syncPersistedMessageMetadata]);
 
   const {
     conversationAgentId,
@@ -980,8 +1019,105 @@ export function ChatPageContent({
   const isPlaywrightSetupVisible =
     !!canUpdateAgent && (isPlaywrightSetupRequired || isPlaywrightCheckLoading);
 
-  // Use actual token usage when available from the stream (no fallback to estimation)
-  const tokensUsed = tokenUsage?.totalTokens;
+  // Stream usage and compaction results both update this live context estimate.
+  const tokensUsed = contextTokensUsed ?? tokenUsage?.totalTokens;
+  const isContextCompacting =
+    !!contextCompaction?.isCompacting || compactConversationMutation.isPending;
+
+  const handleCompactConversation = useCallback(async () => {
+    if (!conversationId || isReadOnlyConversation) {
+      return;
+    }
+
+    setManualCompactionFeedback({
+      status: "pending",
+      message: "Compacting conversation context...",
+    });
+
+    const result = await compactConversationMutation.mutateAsync({
+      id: conversationId,
+    });
+    if (!result) {
+      setManualCompactionFeedback({
+        status: "failed",
+        message: "Context compaction failed.",
+      });
+      return;
+    }
+
+    syncPersistedMessageMetadata(
+      (result.conversation.messages ?? []) as UIMessage[],
+    );
+
+    if (result.status === "created") {
+      if (result.compaction) {
+        recordContextCompaction?.({
+          compactionId: result.compaction.id,
+          originalTokenEstimate: result.compaction.originalTokenEstimate,
+          compactedTokenEstimate: result.compaction.compactedTokenEstimate,
+        });
+      }
+
+      setManualCompactionFeedback(null);
+      return;
+    }
+
+    if (result.status === "existing") {
+      if (result.compaction) {
+        recordContextCompaction?.({
+          compactionId: result.compaction.id,
+          originalTokenEstimate: result.compaction.originalTokenEstimate,
+          compactedTokenEstimate: result.compaction.compactedTokenEstimate,
+        });
+      }
+
+      setManualCompactionFeedback({
+        status: "skipped",
+        message: getManualCompactionSkippedMessage(
+          result.reason,
+          result.status,
+        ),
+      });
+      return;
+    }
+
+    if (result.status === "skipped") {
+      setManualCompactionFeedback({
+        status: "skipped",
+        message: getManualCompactionSkippedMessage(
+          result.reason,
+          result.status,
+        ),
+      });
+      return;
+    }
+
+    setManualCompactionFeedback({
+      status: "failed",
+      message: "Context compaction failed.",
+    });
+  }, [
+    compactConversationMutation,
+    conversationId,
+    isReadOnlyConversation,
+    recordContextCompaction,
+    syncPersistedMessageMetadata,
+  ]);
+
+  useEffect(() => {
+    if (
+      !manualCompactionFeedback ||
+      manualCompactionFeedback.status === "pending"
+    ) {
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      setManualCompactionFeedback(null);
+    }, 8000);
+
+    return () => clearTimeout(timeout);
+  }, [manualCompactionFeedback]);
 
   useEffect(() => {
     if (
@@ -1838,6 +1974,8 @@ export function ChatPageContent({
                     agentId={currentProfileId || initialAgentId || undefined}
                     messages={messages}
                     status={status}
+                    isContextCompacting={isContextCompacting}
+                    contextCompactionFeedback={manualCompactionFeedback}
                     optimisticToolCalls={optimisticToolCalls}
                     isLoadingConversation={isLoadingConversation}
                     onMessagesUpdate={setMessages}
@@ -1850,6 +1988,7 @@ export function ChatPageContent({
                     selectedModel={conversation?.modelId ?? initialModel}
                     modelSource={conversationModelSource ?? initialModelSource}
                     chatErrors={conversation?.chatErrors ?? []}
+                    compactions={conversation?.compactions ?? []}
                     onUserMessageEdit={(
                       editedMessage,
                       updatedMessages,
@@ -1978,6 +2117,8 @@ export function ChatPageContent({
                           conversation?.agent?.llmApiKeyId ?? null
                         }
                         submitDisabled={isPlaywrightSetupVisible}
+                        isContextCompacting={isContextCompacting}
+                        onCompactConversation={handleCompactConversation}
                         isPlaywrightSetupVisible={isPlaywrightSetupVisible}
                         selectorAgentId={activeAgentId}
                         selectorAgentName={swappedAgentName ?? undefined}
@@ -2218,73 +2359,6 @@ function clearUserPromptQueryParam(params: {
     ? `${params.pathname}?${nextSearchParams.toString()}`
     : params.pathname;
   params.router.replace(nextUrl);
-}
-
-function mergePersistedMessageMetadata(params: {
-  liveMessages: UIMessage[];
-  persistedMessages: UIMessage[];
-}): UIMessage[] {
-  const remainingPersistedMessages = [...params.persistedMessages];
-
-  return params.liveMessages.map((liveMessage) => {
-    if (hasCreatedAtMetadata(liveMessage)) {
-      return liveMessage;
-    }
-
-    const persistedIndex = remainingPersistedMessages.findIndex(
-      (persistedMessage) =>
-        messagesHaveSameRenderableContent({
-          liveMessage,
-          persistedMessage,
-        }),
-    );
-
-    if (persistedIndex === -1) {
-      return liveMessage;
-    }
-
-    const [persistedMessage] = remainingPersistedMessages.splice(
-      persistedIndex,
-      1,
-    );
-
-    return {
-      ...liveMessage,
-      metadata: {
-        ...getObjectMetadata(persistedMessage),
-        ...getObjectMetadata(liveMessage),
-      },
-    };
-  });
-}
-
-function messagesHaveSameRenderableContent(params: {
-  liveMessage: UIMessage;
-  persistedMessage: UIMessage;
-}) {
-  return (
-    params.liveMessage.role === params.persistedMessage.role &&
-    getMessageText(params.liveMessage) ===
-      getMessageText(params.persistedMessage)
-  );
-}
-
-function getMessageText(message: UIMessage) {
-  return message.parts
-    .filter((part) => part.type === "text")
-    .map((part) => part.text)
-    .join("\n");
-}
-
-function hasCreatedAtMetadata(message: UIMessage) {
-  const metadata = getObjectMetadata(message);
-  return typeof metadata.createdAt === "string";
-}
-
-function getObjectMetadata(message: UIMessage): Record<string, unknown> {
-  return typeof message.metadata === "object" && message.metadata !== null
-    ? { ...message.metadata }
-    : {};
 }
 
 // =========================================================================
