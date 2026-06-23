@@ -42225,6 +42225,8 @@ export type GetLlmModelsResponses = {
         isBest?: boolean;
         isFree: boolean;
         embeddingDimensions?: EmbeddingDimensions | null;
+        requiresUserConnection?: boolean;
+        isConnected?: boolean;
     }>;
 };
 
