@@ -1,6 +1,9 @@
 "use client";
 
-import { PROJECT_INSTRUCTIONS_FILENAME } from "@archestra/shared";
+import {
+  isEditableTextFile,
+  PROJECT_INSTRUCTIONS_FILENAME,
+} from "@archestra/shared";
 import {
   CalendarClock,
   Download,
@@ -220,6 +223,9 @@ function ProjectDetail() {
         <ProjectFilesSidebar
           projectId={project.id}
           canManageProject={canManage}
+          // Anyone with real project access (owner or shared) may edit its text
+          // files; the admin-oversight view is read-only.
+          canEditFiles={!isAdminView}
         />
       </div>
     </div>
@@ -349,13 +355,19 @@ function ChatsList({
 function ProjectFilesSidebar({
   projectId,
   canManageProject,
+  canEditFiles,
 }: {
   projectId: string;
   /** Owner / project-admin — gates editing the pinned instructions. */
   canManageProject: boolean;
+  /** Real project access (owner/shared, not oversight) — gates editing files. */
+  canEditFiles: boolean;
 }) {
   const { data: files } = useProjectFiles(projectId);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // The selected file's in-place editor is open. Lifted here so the Edit toggle
+  // can sit in the action row next to Download/Delete.
+  const [editing, setEditing] = useState(false);
   // Opening a file shows it below the list (split); `expanded` fills the panel.
   const [expanded, setExpanded] = useState(false);
 
@@ -370,6 +382,8 @@ function ProjectFilesSidebar({
       name: f.filename,
       mimeType: f.mimeType,
       contentUrl: sandboxArtifactUrl(f.downloadRef),
+      // The real row id (null for a rowless hand-placed object) — gates editing.
+      rowId: f.id,
     }));
   const selected = items.find((i) => i.id === selectedId) ?? null;
   const instructionsSelected = selectedId === INSTRUCTIONS_SELECTION;
@@ -377,14 +391,28 @@ function ProjectFilesSidebar({
   const detailName = instructionsSelected
     ? PROJECT_INSTRUCTIONS_FILENAME
     : (selected?.name ?? "");
+  // Editable only for a row-backed .md/.txt file when the viewer has real project
+  // access (the admin-oversight view is read-only, so `canEditFiles` is false).
+  const selectedEditable =
+    selected != null &&
+    canEditFiles &&
+    selected.rowId != null &&
+    isEditableTextFile({
+      filename: selected.name,
+      mimeType: selected.mimeType,
+    });
 
   const openFile = (id: string) => {
     setSelectedId(id);
+    // Files and instructions both open in the read view; editing is entered
+    // explicitly via the Edit affordance in the action row.
+    setEditing(false);
     setExpanded(false);
   };
   const collapse = () => setExpanded(false);
   const deselect = () => {
     setSelectedId(null);
+    setEditing(false);
     setExpanded(false);
   };
 
@@ -394,6 +422,7 @@ function ProjectFilesSidebar({
   useEffect(() => {
     if (selectedMissing) {
       setSelectedId(null);
+      setEditing(false);
       setExpanded(false);
     }
   }, [selectedMissing]);
@@ -449,6 +478,17 @@ function ProjectFilesSidebar({
                 onExpand={() => setExpanded(true)}
                 onCollapse={collapse}
               >
+                {instructionsSelected && canManageProject && !editing && (
+                  <button
+                    type="button"
+                    onClick={() => setEditing(true)}
+                    title="Edit instructions"
+                    className="flex h-8 w-8 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                  >
+                    <Pencil className="h-4 w-4" />
+                    <span className="sr-only">Edit instructions</span>
+                  </button>
+                )}
                 {selected && !instructionsSelected && (
                   <div className="flex shrink-0 items-center">
                     {selected.contentUrl && (
@@ -463,6 +503,17 @@ function ProjectFilesSidebar({
                           Download {selected.name}
                         </span>
                       </a>
+                    )}
+                    {selectedEditable && !editing && (
+                      <button
+                        type="button"
+                        onClick={() => setEditing(true)}
+                        title={`Edit ${selected.name}`}
+                        className="flex h-8 w-8 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                      >
+                        <Pencil className="h-4 w-4" />
+                        <span className="sr-only">Edit {selected.name}</span>
+                      </button>
                     )}
                     <button
                       type="button"
@@ -485,10 +536,21 @@ function ProjectFilesSidebar({
               <ProjectInstructionsPanel
                 projectId={projectId}
                 isOwner={canManageProject}
-                onClose={deselect}
+                editing={editing}
+                onExitEdit={() => setEditing(false)}
               />
             ) : previewing && selected ? (
-              <FilePreview file={selected} onClose={deselect} />
+              <FilePreview
+                // Per-file key: drop any editor state when the previewed file changes.
+                key={selected.id}
+                file={selected}
+                onClose={deselect}
+                // Only row-backed files are editable; a rowless (obj_) object has
+                // no `rowId`, so `selectedEditable` is false and Edit stays hidden.
+                fileId={selected.rowId ?? undefined}
+                editing={editing && selectedEditable}
+                onExitEdit={() => setEditing(false)}
+              />
             ) : null}
           </div>
         </div>

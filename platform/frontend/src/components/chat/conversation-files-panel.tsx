@@ -1,7 +1,17 @@
 "use client";
 
-import { PROJECT_INSTRUCTIONS_FILENAME } from "@archestra/shared";
-import { Check, Copy, Download, File as FileIcon, Trash2 } from "lucide-react";
+import {
+  isEditableTextFile,
+  PROJECT_INSTRUCTIONS_FILENAME,
+} from "@archestra/shared";
+import {
+  Check,
+  Copy,
+  Download,
+  File as FileIcon,
+  Pencil,
+  Trash2,
+} from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { ConversationArtifactPanel } from "@/components/chat/conversation-artifact";
 import { FileDetailHeader } from "@/components/chat/file-detail-header";
@@ -81,17 +91,41 @@ export function ConversationFilesPanel({
   const instructionsSelectedRef = useRef(false);
   instructionsSelectedRef.current = instructionsSelected;
 
+  // The selected file's in-place editor is open. Lifted here (not inside
+  // FilePreview) so the Edit toggle can live in the action row next to
+  // Download/Delete. A ref mirrors it so the "follow latest output" effect below
+  // can avoid yanking the view (and an unsaved draft) away when a new file lands
+  // during a run — the same guard the instructions editor gets.
+  const [editing, setEditing] = useState(false);
+  const editingRef = useRef(false);
+  editingRef.current = editing;
+  // Only .md/.txt files the viewer can manage are editable; attachments and the
+  // in-memory artifact never are. `canManageFiles` is the same gate as Delete.
+  const selectedEditable =
+    selected != null &&
+    canManageFiles &&
+    selected.source !== "attachment" &&
+    selected.source !== "artifact" &&
+    isEditableTextFile({
+      filename: selected.name,
+      mimeType: selected.mimeType,
+    });
+
   // Something is open (file, artifact, or the pinned instructions) → show the
   // preview. Split by default; `expanded` hides the list and fills the panel.
   const previewing = selected !== null || instructionsSelected;
 
   const openFile = (id: string) => {
     setSelectedId(id);
+    // Everything (files and instructions) opens in the read view; editing is
+    // entered explicitly via the Edit affordance in the action row.
+    setEditing(false);
     setExpanded(false);
   };
   const collapse = () => setExpanded(false);
   const deselect = () => {
     setSelectedId(null);
+    setEditing(false);
     setExpanded(false);
   };
 
@@ -110,6 +144,7 @@ export function ConversationFilesPanel({
   useEffect(() => {
     if (selectedMissing) {
       setSelectedId(null);
+      setEditing(false);
       setExpanded(false);
     }
   }, [selectedMissing]);
@@ -135,6 +170,8 @@ export function ConversationFilesPanel({
     // Don't yank the view away from the instructions editor (and its unsaved
     // draft) when a new output lands while the owner is editing.
     if (instructionsSelectedRef.current) return;
+    // Same for an open file editor with an unsaved draft.
+    if (editingRef.current) return;
 
     if (hasArtifact && artifact !== prevArtifact) {
       setSelectedId("artifact");
@@ -260,6 +297,19 @@ export function ConversationFilesPanel({
               content={artifact ?? ""}
               onDownloadPdf={handleDownloadArtifactPdf}
             />
+          ) : instructionsSelected ? (
+            isProjectOwner &&
+            !editing && (
+              <button
+                type="button"
+                onClick={() => setEditing(true)}
+                title="Edit instructions"
+                className="flex h-8 w-8 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+              >
+                <Pencil className="h-4 w-4" />
+                <span className="sr-only">Edit instructions</span>
+              </button>
+            )
           ) : (
             selected && (
               <div className="flex shrink-0 items-center">
@@ -273,6 +323,17 @@ export function ConversationFilesPanel({
                     <Download className="h-4 w-4" />
                     <span className="sr-only">Download {selected.name}</span>
                   </a>
+                )}
+                {selectedEditable && !editing && (
+                  <button
+                    type="button"
+                    onClick={() => setEditing(true)}
+                    title={`Edit ${selected.name}`}
+                    className="flex h-8 w-8 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                  >
+                    <Pencil className="h-4 w-4" />
+                    <span className="sr-only">Edit {selected.name}</span>
+                  </button>
                 )}
                 {canManageFiles && (
                   <button
@@ -299,12 +360,21 @@ export function ConversationFilesPanel({
         <ProjectInstructionsPanel
           projectId={projectId}
           isOwner={isProjectOwner}
-          onClose={deselect}
+          editing={editing}
+          onExitEdit={() => setEditing(false)}
         />
       )}
 
       {previewing && !artifactSelected && !instructionsSelected && selected && (
-        <FilePreview file={selected} onClose={deselect} />
+        <FilePreview
+          // Per-file key: drop any editor state when the previewed file changes.
+          key={selected.id}
+          file={selected}
+          onClose={deselect}
+          fileId={selected.id}
+          editing={editing && selectedEditable}
+          onExitEdit={() => setEditing(false)}
+        />
       )}
 
       {hasArtifact && (
