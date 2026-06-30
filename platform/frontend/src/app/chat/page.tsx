@@ -21,6 +21,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { toast } from "sonner";
 import { CreateProjectFromChatDialog } from "@/app/_parts/create-project-from-chat-dialog";
 import { scheduledRunContext } from "@/app/_parts/scheduled-run-sidebar.utils";
 import { CustomServerRequestDialog } from "@/app/mcp/registry/_parts/custom-server-request-dialog";
@@ -131,6 +132,10 @@ import {
 } from "@/lib/chat/use-chat-preferences";
 import { useInitialChatModelState } from "@/lib/chat/use-initial-chat-model-state.hook";
 import { useConfig, useFeature } from "@/lib/config/config.query";
+import {
+  type ConnectivityState,
+  useConnectivity,
+} from "@/lib/config/connectivity";
 import { useDialogs } from "@/lib/hooks/use-dialog";
 import { useIsMobile } from "@/lib/hooks/use-mobile";
 import { useLlmModels, useLlmModelsByProvider } from "@/lib/llm-models.query";
@@ -164,6 +169,19 @@ function parseRightPanelTab(value: string | null): RightPanelTab | null {
   return RIGHT_PANEL_TABS.includes(value as RightPanelTab)
     ? (value as RightPanelTab)
     : null;
+}
+
+// Copy for the chat-send guard, picked per failure mode so the message matches
+// reality (browser offline vs backend down, which is not "you're offline").
+function offlineSubmitMessage(
+  kind: Exclude<ConnectivityState["kind"], "online">,
+): string {
+  switch (kind) {
+    case "browser-offline":
+      return "You're offline — your message wasn't sent. Try again once you're back online.";
+    case "backend-unreachable":
+      return "Can't reach the server — your message wasn't sent. Try again in a moment.";
+  }
 }
 
 export function ChatPageContent({
@@ -445,6 +463,7 @@ export function ChatPageContent({
     initialMessages: persistedConversationMessages,
     enabled: shouldEnableChatSession,
   });
+  const connectivity = useConnectivity();
   const sharedConversationMessages = useMemo(
     () => (conversation?.messages ?? []) as PartialUIMessage[],
     [conversation?.messages],
@@ -1292,6 +1311,14 @@ export function ChatPageContent({
       throw new Error("stop-not-submit");
     }
 
+    const { kind: connectivityKind } = connectivity.state;
+    if (connectivityKind !== "online") {
+      toast.error(offlineSubmitMessage(connectivityKind));
+      // Throw to keep the textarea and draft intact (onSubmit contract): the
+      // user keeps their message instead of losing it to a silent failure.
+      throw new Error("offline-not-submit");
+    }
+
     const hasText = message.text?.trim();
     const hasFiles = message.files && message.files.length > 0;
     // a skill slash command may be sent on its own, with no prompt or files
@@ -1695,9 +1722,15 @@ export function ChatPageContent({
     useCallback(
       (message, e, options) => {
         e.preventDefault();
+        const { kind: connectivityKind } = connectivity.state;
+        if (connectivityKind !== "online") {
+          toast.error(offlineSubmitMessage(connectivityKind));
+          // Throw to keep the textarea and draft intact (onSubmit contract).
+          throw new Error("offline-not-submit");
+        }
         submitInitialMessage(message, options?.skill);
       },
-      [submitInitialMessage],
+      [submitInitialMessage, connectivity.state],
     );
 
   // A chat started from a project page keeps the Files panel open when the
