@@ -32,6 +32,7 @@ import {
 } from "ai";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
+import { resolveAgentMaxOutputTokens } from "@/agents/agent-output-budget";
 import { MAX_AGENT_STEPS, runAgentStream } from "@/agents/agent-run-stream";
 import { archestraMcpBranding } from "@/archestra-mcp-server";
 import { hasAnyAgentTypeAdminPermission, userHasPermission } from "@/auth";
@@ -1090,6 +1091,16 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                     },
                   };
                 }
+
+                // Request the model's real output ceiling (clamped by the
+                // operator ceiling), or a safe fallback when it is unknown.
+                // Without this, providers that inject a small default max
+                // (e.g. Anthropic's ~4096) truncated large tool-call payloads
+                // and final submission turns.
+                streamTextConfig.maxOutputTokens = resolveAgentMaxOutputTokens({
+                  outputLength: modelRow?.outputLength ?? null,
+                  ceiling: config.chat.maxOutputTokensCeiling,
+                });
 
                 const { result } = await runAgentStream({
                   config: streamTextConfig,
