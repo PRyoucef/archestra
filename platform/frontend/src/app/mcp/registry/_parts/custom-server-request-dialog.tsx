@@ -35,6 +35,7 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { useCreateMcpServerInstallationRequest } from "@/lib/mcp/mcp-server-installation-request.query";
+import { parseJsonConfig } from "./json-config-parser";
 
 const customServerRequestSchema = z
   .object({
@@ -94,6 +95,25 @@ export function CustomServerRequestDialog({
   });
 
   const createRequest = useCreateMcpServerInstallationRequest();
+
+  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement | HTMLInputElement>) => {
+    const pastedText = e.clipboardData.getData("text");
+    const parsed = parseJsonConfig(pastedText);
+    
+    if (parsed) {
+      e.preventDefault();
+      
+      if (parsed.command) {
+        form.setValue("command", parsed.command, { shouldDirty: true });
+      }
+      if (parsed.arguments) {
+        form.setValue("arguments", parsed.arguments, { shouldDirty: true });
+      }
+      if (parsed.environment && parsed.environment.length > 0) {
+        form.setValue("environment", parsed.environment as any, { shouldDirty: true });
+      }
+    }
+  };
 
   const onSubmit = async (values: CustomServerRequestFormValues) => {
     const customServerConfig: NonNullable<
@@ -265,7 +285,7 @@ export function CustomServerRequestDialog({
                       <FormItem>
                         <FormLabel>Command *</FormLabel>
                         <FormControl>
-                          <Input placeholder="node" {...field} />
+                          <Input placeholder="node" {...field} onPaste={handlePaste} />
                         </FormControl>
                         <FormMessage />
                       </FormItem>
@@ -282,6 +302,7 @@ export function CustomServerRequestDialog({
                             placeholder={`/path/to/server.js\n--verbose`}
                             rows={3}
                             {...field}
+                            onPaste={handlePaste}
                           />
                         </FormControl>
                         <FormMessage />

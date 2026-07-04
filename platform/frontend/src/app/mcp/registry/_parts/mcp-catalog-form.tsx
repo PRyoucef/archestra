@@ -104,6 +104,7 @@ import {
   transformCatalogItemToFormValues,
   transformFormToApiData,
 } from "./mcp-catalog-form.utils";
+import { parseJsonConfig } from "./json-config-parser";
 
 const ExternalSecretSelector = lazy(
   () =>
@@ -766,6 +767,25 @@ export function McpCatalogForm({
     { mode: "add" } | { mode: "edit"; index: number } | null
   >(null);
 
+  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement | HTMLInputElement>) => {
+    const pastedText = e.clipboardData.getData("text");
+    const parsed = parseJsonConfig(pastedText);
+    
+    if (parsed) {
+      e.preventDefault();
+      
+      if (parsed.command) {
+        form.setValue("localConfig.command", parsed.command, { shouldDirty: true });
+      }
+      if (parsed.arguments) {
+        form.setValue("localConfig.arguments", parsed.arguments, { shouldDirty: true });
+      }
+      if (parsed.environment && parsed.environment.length > 0) {
+        form.setValue("localConfig.environment", parsed.environment as any, { shouldDirty: true });
+      }
+    }
+  };
+
   // Fetch available k8s docker-registry secrets for the "existing" dropdown
   const { data: k8sSecrets = [] } = useK8sImagePullSecrets();
   const imagePullSecretItems = useMemo(
@@ -1279,6 +1299,7 @@ export function McpCatalogForm({
                             className="font-mono"
                             autoComplete={MCP_CONFIG_AUTOCOMPLETE}
                             {...field}
+                            onPaste={handlePaste}
                           />
                         </FormControl>
                         <FormDescription>
@@ -1305,6 +1326,7 @@ export function McpCatalogForm({
                             placeholder={`/path/to/server.js\n--verbose`}
                             className="font-mono min-h-20"
                             {...field}
+                            onPaste={handlePaste}
                           />
                         </FormControl>
                         <FormMessage />
