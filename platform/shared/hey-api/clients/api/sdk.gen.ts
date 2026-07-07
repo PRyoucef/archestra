@@ -5371,7 +5371,7 @@ export const getMemberSignupStatus = <ThrowOnError extends boolean = false>(opti
 export const deletePendingSignupMember = <ThrowOnError extends boolean = false>(options: Options<DeletePendingSignupMemberData, ThrowOnError>) => (options.client ?? client).delete<DeletePendingSignupMemberResponses, DeletePendingSignupMemberErrors, ThrowOnError>({ url: '/api/organization/members/{userId}/pending-signup', ...options });
 
 /**
- * Get all members of the organization
+ * List organization members visible to the caller. Callers with the member:read permission (admins and equivalent custom roles) receive the full organization roster; other authenticated users receive only the members they share a team with.
  *
  * Authentication:
  *
@@ -5379,7 +5379,7 @@ export const deletePendingSignupMember = <ThrowOnError extends boolean = false>(
  *
  * Authorization:
  *
- * `member:read`: View organization members and their roles
+ * None (no additional RBAC permission required)
  */
 export const getOrganizationMembers = <ThrowOnError extends boolean = false>(options?: Options<GetOrganizationMembersData, ThrowOnError>) => (options?.client ?? client).get<GetOrganizationMembersResponses, GetOrganizationMembersErrors, ThrowOnError>({ url: '/api/organization/members', ...options });
 
