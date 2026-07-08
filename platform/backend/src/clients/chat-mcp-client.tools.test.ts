@@ -654,6 +654,264 @@ describe("getChatMcpTools agent delegation execute pipeline", () => {
       }),
     );
   });
+
+  test("a run reuses the cached tool set instead of refetching from the gateway", async () => {
+    const { agent, org, baseParams, gatewayClient } = await setupChatToolEnv();
+    await makeAssignedDelegationTool({
+      agentId: agent.id,
+      organizationId: org.id,
+      childName: "Child Worker",
+    });
+
+    const params = { ...baseParams, delegationChain: agent.id };
+    await chatClient.getChatMcpTools(params);
+    await chatClient.getChatMcpTools(params);
+
+    expect(gatewayClient.listTools).toHaveBeenCalledTimes(1);
+  });
+
+  test("clearChatMcpClient purges tool entries whose key carries a delegation chain", async () => {
+    const { agent, user, org, conversation, baseParams, gatewayClient } =
+      await setupChatToolEnv();
+    await makeAssignedDelegationTool({
+      agentId: agent.id,
+      organizationId: org.id,
+      childName: "Child Worker",
+    });
+
+    const params = {
+      ...baseParams,
+      delegationChain: `root-agent:${agent.id}`,
+    };
+    await chatClient.getChatMcpTools(params);
+    expect(gatewayClient.listTools).toHaveBeenCalledTimes(1);
+
+    // Invalidation matches tool-cache keys by their `<agentId>:` prefix, so a
+    // chain appended to the key must not push the agent id out of that prefix.
+    chatClient.clearChatMcpClient(agent.id);
+    chatClient.__test.setCachedClient(
+      chatClient.__test.getCacheKey(agent.id, user.id, conversation?.id),
+      gatewayClient,
+    );
+
+    await chatClient.getChatMcpTools(params);
+    expect(gatewayClient.listTools).toHaveBeenCalledTimes(2);
+  });
+
+  test("closeChatMcpClient purges tool entries for every chain in the execution", async () => {
+    const isolationKey = "headless-exec-close";
+    const { agent, user, org, baseParams, gatewayClient } =
+      await setupChatToolEnv({ isolationKey });
+    await makeAssignedDelegationTool({
+      agentId: agent.id,
+      organizationId: org.id,
+      childName: "Child Worker",
+    });
+
+    // One execution reaches this agent at two depths, so the execution owns two
+    // tool-cache entries. Cleanup must reclaim both, not just a chainless key.
+    await chatClient.getChatMcpTools({
+      ...baseParams,
+      delegationChain: agent.id,
+    });
+    await chatClient.getChatMcpTools({
+      ...baseParams,
+      delegationChain: `root-agent:${agent.id}`,
+    });
+    expect(gatewayClient.listTools).toHaveBeenCalledTimes(2);
+
+    chatClient.closeChatMcpClient(agent.id, user.id, isolationKey);
+    chatClient.__test.setCachedClient(
+      chatClient.__test.getCacheKey(agent.id, user.id, isolationKey),
+      gatewayClient,
+    );
+
+    await chatClient.getChatMcpTools({
+      ...baseParams,
+      delegationChain: agent.id,
+    });
+    expect(gatewayClient.listTools).toHaveBeenCalledTimes(3);
+  });
+
+  test("__test.clearToolCache(cacheKey) drops every chain variant for that scope", async () => {
+    const { agent, user, org, conversation, baseParams, gatewayClient } =
+      await setupChatToolEnv();
+    await makeAssignedDelegationTool({
+      agentId: agent.id,
+      organizationId: org.id,
+      childName: "Child Worker",
+    });
+
+    await chatClient.getChatMcpTools({
+      ...baseParams,
+      delegationChain: `root-agent:${agent.id}`,
+    });
+    expect(gatewayClient.listTools).toHaveBeenCalledTimes(1);
+
+    // Scoped clearing must reclaim chain variants too, or a case leaks tool
+    // entries into the next one.
+    await chatClient.__test.clearToolCache(
+      chatClient.__test.getCacheKey(agent.id, user.id, conversation?.id),
+    );
+
+    await chatClient.getChatMcpTools({
+      ...baseParams,
+      delegationChain: `root-agent:${agent.id}`,
+    });
+    expect(gatewayClient.listTools).toHaveBeenCalledTimes(2);
+  });
+
+  test("clearing one scope leaves a sibling scope whose key is a string prefix of it", async () => {
+    const { agent, user, org, baseParams, gatewayClient } =
+      await setupChatToolEnv({ isolationKey: "exec-1" });
+    await makeAssignedDelegationTool({
+      agentId: agent.id,
+      organizationId: org.id,
+      childName: "Child Worker",
+    });
+
+    // "exec-1" is a string prefix of "exec-10", so a prefix delete that does not
+    // stop at the ":" separator would reclaim the sibling execution's tools too.
+    const seedClient = (key: string) =>
+      chatClient.__test.setCachedClient(
+        chatClient.__test.getCacheKey(agent.id, user.id, key),
+        gatewayClient,
+      );
+    seedClient("exec-10");
+
+    const chain = `root-agent:${agent.id}`;
+    const shortScope = {
+      ...baseParams,
+      isolationKey: "exec-1",
+      delegationChain: chain,
+    };
+    const longScope = {
+      ...baseParams,
+      isolationKey: "exec-10",
+      delegationChain: chain,
+    };
+
+    await chatClient.getChatMcpTools(shortScope);
+    await chatClient.getChatMcpTools(longScope);
+    expect(gatewayClient.listTools).toHaveBeenCalledTimes(2);
+
+    chatClient.closeChatMcpClient(agent.id, user.id, "exec-1");
+
+    // The sibling execution keeps its cached tools.
+    await chatClient.getChatMcpTools(longScope);
+    expect(gatewayClient.listTools).toHaveBeenCalledTimes(2);
+
+    // The cleared execution refetches.
+    seedClient("exec-1");
+    await chatClient.getChatMcpTools(shortScope);
+    expect(gatewayClient.listTools).toHaveBeenCalledTimes(3);
+  });
+
+  test("tools cached for one delegation chain never serve another chain", async () => {
+    const { agent, org, baseParams } = await setupChatToolEnv();
+    const { targetAgent, delegationTool } = await makeAssignedDelegationTool({
+      agentId: agent.id,
+      organizationId: org.id,
+      childName: "Child Worker",
+    });
+
+    mockExecuteA2AMessage.mockResolvedValue({
+      messageId: "child-msg-1",
+      text: "child says hi",
+      finishReason: "stop",
+    });
+
+    // The same agent, at two depths of one delegation tree. Both share an
+    // isolation key, so a chain-agnostic cache would hand the second run the
+    // first run's ancestors — hiding them from the executor's cycle check.
+    const shallowChain = agent.id;
+    const deeperChain = `root-agent:middle-agent:${agent.id}`;
+
+    const shallowTools = await chatClient.getChatMcpTools({
+      ...baseParams,
+      delegationChain: shallowChain,
+    });
+    const deeperTools = await chatClient.getChatMcpTools({
+      ...baseParams,
+      delegationChain: deeperChain,
+    });
+
+    await deeperTools[delegationTool.name].execute?.(
+      { message: "do the work" },
+      execOptions("call-deep-chain"),
+    );
+    expect(mockExecuteA2AMessage).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        agentId: targetAgent.id,
+        parentDelegationChain: deeperChain,
+      }),
+    );
+
+    // The shallow run's tools still carry their own ancestors: the two runs
+    // hold separate contexts rather than overwriting a shared one.
+    await shallowTools[delegationTool.name].execute?.(
+      { message: "do the work" },
+      execOptions("call-shallow-chain"),
+    );
+    expect(mockExecuteA2AMessage).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        agentId: targetAgent.id,
+        parentDelegationChain: shallowChain,
+      }),
+    );
+  });
+
+  test("a delegation dispatched through run_tool carries the caller's chain", async () => {
+    const { agent, org, baseParams } = await setupChatToolEnv({
+      gatewayTools: [
+        {
+          name: getArchestraToolFullName("run_tool"),
+          description: "Run tool",
+          inputSchema: {
+            type: "object",
+            properties: {
+              tool_name: { type: "string" },
+              tool_args: { type: "object" },
+            },
+            required: ["tool_name"],
+          },
+        },
+      ],
+    });
+    const { targetAgent, delegationTool } = await makeAssignedDelegationTool({
+      agentId: agent.id,
+      organizationId: org.id,
+      childName: "Child Worker",
+    });
+
+    mockExecuteA2AMessage.mockResolvedValue({
+      messageId: "child-msg-1",
+      text: "child says hi",
+      finishReason: "stop",
+    });
+
+    const chain = `root-agent:${agent.id}`;
+    const tools = await chatClient.getChatMcpTools({
+      ...baseParams,
+      delegationChain: chain,
+    });
+    await tools[getArchestraToolFullName("run_tool")].execute?.(
+      {
+        tool_name: delegationTool.name,
+        tool_args: { message: "do the work" },
+      },
+      execOptions("call-run-tool-delegation"),
+    );
+
+    // run_tool dispatches delegations too, so its context must name the
+    // caller's ancestors — otherwise the chain restarts and cycles go unseen.
+    expect(mockExecuteA2AMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: targetAgent.id,
+        parentDelegationChain: chain,
+      }),
+    );
+  });
 });
 
 describe("getChatMcpTools approval gating", () => {
