@@ -1,7 +1,7 @@
 "use client";
 
 import type { UIMessage } from "@ai-sdk/react";
-import type { ChatSkillMetadata } from "@archestra/shared";
+import type { ChatMessageFeedback, ChatSkillMetadata } from "@archestra/shared";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -112,6 +112,7 @@ import {
   useUpdateMemberDefaultModel,
 } from "@/lib/chat/chat.query";
 import { useChatAgentState } from "@/lib/chat/chat-agent-state.hook";
+import { useSetChatMessageFeedback } from "@/lib/chat/chat-message.query";
 import { chatMessageQueue } from "@/lib/chat/chat-message-queue";
 import {
   useConversationShare,
@@ -119,9 +120,11 @@ import {
   useForkSharedConversation,
 } from "@/lib/chat/chat-share.query";
 import {
+  applyFeedbackToMessages,
   conversationStorageKeys,
   getConversationDisplayTitle,
   getManualCompactionSkippedMessage,
+  getMessageFeedback,
   mergePersistedMessageMetadata,
 } from "@/lib/chat/chat-utils";
 import { resolveEnabledToolIds } from "@/lib/chat/enabled-tools-selection";
@@ -1036,6 +1039,49 @@ export function ChatPageContent({
   const status = chatSession?.status ?? "ready";
   const setMessages = chatSession?.setMessages;
   const stop = chatSession?.stop;
+
+  // Thumbs feedback on assistant messages: optimistic apply + rollback against
+  // the originating session's setter, captured here so a conversation switch
+  // mid-request cannot retarget the rollback (or the invalidation, which the
+  // mutation keys off its per-call variables). The rollback rides this
+  // closure's own promise chain, NOT a mutation callback: switching
+  // conversations remounts the page and unmounts the mutation observer, which
+  // makes TanStack skip per-call callbacks — while the originating session
+  // (and this closure's setter into it) lives on in the global chat context.
+  const setChatMessageFeedback = useSetChatMessageFeedback();
+  const handleMessageFeedback = useCallback(
+    (messageId: string, feedback: ChatMessageFeedback | null) => {
+      const applyMessages = setMessages;
+      if (!applyMessages || !conversationId) {
+        return;
+      }
+      const previousFeedback = getMessageFeedback(
+        messages.find((message) => message.id === messageId),
+      );
+      applyMessages((current) =>
+        applyFeedbackToMessages({ messages: current, messageId, feedback }),
+      );
+      setChatMessageFeedback
+        .mutateAsync({ messageId, conversationId, feedback })
+        .catch(() => {
+          // Error toast already handled inside the mutation; only roll back —
+          // and only while the message still shows THIS request's value, so a
+          // slow failure can't overwrite a newer rating made in the meantime.
+          applyMessages((current) => {
+            const target = current.find((message) => message.id === messageId);
+            if (getMessageFeedback(target) !== feedback) {
+              return current;
+            }
+            return applyFeedbackToMessages({
+              messages: current,
+              messageId,
+              feedback: previousFeedback,
+            });
+          });
+        });
+    },
+    [setMessages, conversationId, messages, setChatMessageFeedback],
+  );
   // Message queueing is beta, gated by the ARCHESTRA_BETA master switch.
   const isMessageQueueEnabled = useFeature("betaEnabled") ?? false;
 
@@ -2482,6 +2528,12 @@ export function ChatPageContent({
                           optimisticToolCalls={optimisticToolCalls}
                           isLoadingConversation={isLoadingConversation}
                           onMessagesUpdate={setMessages}
+                          onMessageFeedback={
+                            // No thumbs until the live session's setter exists —
+                            // a click before then could not apply or roll back.
+                            setMessages ? handleMessageFeedback : undefined
+                          }
+                          feedbackDisabled={setChatMessageFeedback.isPending}
                           agentName={
                             (currentProfileId
                               ? internalAgents.find(
