@@ -42,7 +42,6 @@ import { ChatStatusAnnouncer } from "@/components/chat/chat-status-announcer";
 import { ConversationFilesPanel } from "@/components/chat/conversation-files-panel";
 import { ConversationHeader } from "@/components/chat/conversation-header";
 import { InitialAgentSelector } from "@/components/chat/initial-agent-selector";
-import { NoToolsModelNotice } from "@/components/chat/no-tools-model-notice";
 import { OnboardingWizardButton } from "@/components/chat/onboarding-wizard-button";
 import {
   PlaywrightInstallDialog,
@@ -2451,7 +2450,15 @@ export function ChatPageContent({
         <div className="flex flex-1 min-h-0">
           <div className="flex-1 flex flex-col min-w-0 min-h-0">
             <div className="flex flex-col h-full min-h-0">
-              <StreamTimeoutWarning status={status} messages={messages} />
+              <StreamTimeoutWarning
+                status={status}
+                transportActivitySequence={
+                  chatSession?.transportActivitySequence ?? 0
+                }
+                responseProgressSequence={
+                  chatSession?.responseProgressSequence ?? 0
+                }
+              />
 
               {/* Mobile: Inline artifact/browser panel below header */}
               {isRightPanelOpen && (
@@ -2648,11 +2655,9 @@ export function ChatPageContent({
                           default="none"
                         >
                           <div className="max-w-4xl mx-auto space-y-3">
-                            {conversationToolsUnavailable && (
-                              <NoToolsModelNotice />
-                            )}
                             <ArchestraPromptInput
                               onSubmit={handleSubmit}
+                              toolsUnavailable={conversationToolsUnavailable}
                               onStop={handleStopStreaming}
                               status={status}
                               selectedModel={conversation?.modelId ?? ""}
@@ -2801,10 +2806,10 @@ export function ChatPageContent({
                           share="chat-composer-morph"
                           default="none"
                         >
-                          <div className="w-full max-w-4xl space-y-3">
-                            {initialToolsUnavailable && <NoToolsModelNotice />}
+                          <div className="w-full max-w-4xl">
                             <ArchestraPromptInput
                               onSubmit={handleInitialSubmit}
+                              toolsUnavailable={initialToolsUnavailable}
                               status={
                                 createConversationMutation.isPending
                                   ? "submitted"

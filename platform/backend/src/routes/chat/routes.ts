@@ -835,6 +835,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                     writer.write({
                       type: "data-heartbeat",
                       data: { timestamp: Date.now() },
+                      transient: true,
                     });
                   } catch {
                     clearInterval(heartbeatInterval);
@@ -914,6 +915,9 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                 // stays hardcoded — its models don't declare capabilities and
                 // it has built-in web search instead of tool calling
                 // (https://docs.perplexity.ai/api-reference/chat-completions-post).
+                // Perplexity's tool calling (2026) exists only on its separate
+                // Agent API (/responses/create, a Responses-style wire format),
+                // not the chat-completions surface we proxy.
                 const supportsToolCalling =
                   provider !== "perplexity" &&
                   modelRow?.supportsToolCalling !== false;
@@ -2725,6 +2729,20 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
         logger.info(
           { conversationId: id, provider: titleLlm.provider },
           "Skipping title generation - no usable API key for the acting user",
+        );
+        return reply.send(conversation);
+      }
+
+      // Microsoft 365 Copilot can't run utility generations: the Graph Chat
+      // API has a fixed product persona and takes our system prompt only as
+      // riding-along additional context, which it routinely ignores — instead
+      // of a title it answers the message (a greeting, emoji included, became
+      // the stored title). Skip so the client keeps its first-user-message
+      // fallback.
+      if (titleLlm.provider === "microsoft-365-copilot") {
+        logger.info(
+          { conversationId: id },
+          "Skipping title generation - Microsoft 365 Copilot does not follow title instructions",
         );
         return reply.send(conversation);
       }
