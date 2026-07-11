@@ -1,4 +1,8 @@
-import { buildTrustedDataBlockedContentNotice } from "@archestra/shared";
+import {
+  buildTrustedDataBlockedContentNotice,
+  extractMcpToolError,
+  isSeededAppRenderToolResult,
+} from "@archestra/shared";
 import { DualLlmSubagent } from "@/agents/subagents/dual-llm";
 import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
 import logger from "@/logging";
@@ -88,6 +92,7 @@ export async function evaluateIfContextIsTrusted(
     toolName: string;
     // biome-ignore lint/suspicious/noExplicitAny: tool outputs can be any shape
     toolResult: any;
+    isPlatformAuthoredResult: boolean;
   }> = [];
 
   for (const message of messages) {
@@ -97,6 +102,16 @@ export async function evaluateIfContextIsTrusted(
           toolCallId: toolCall.id,
           toolName: toolCall.name,
           toolResult: toolCall.content,
+          // Results the platform itself authored carry no external data and
+          // must not flip the context to untrusted:
+          // - a platform-generated `tool_state` envelope (e.g. unknown_tool)
+          //   means no upstream tool ran, so the result is our own text;
+          // - a seeded app render (open-in-chat conversation seeding) is a
+          //   platform-built render pointer, marked with a reserved `_meta`
+          //   key that mcp-client strips from every live upstream result.
+          isPlatformAuthoredResult:
+            extractMcpToolError(toolCall)?.type === "tool_state" ||
+            isSeededAppRenderToolResult(toolCall.content),
         });
       }
     }
@@ -142,7 +157,15 @@ export async function evaluateIfContextIsTrusted(
 
   // Process evaluation results
   for (let i = 0; i < allToolCalls.length; i++) {
-    const { toolCallId, toolResult, toolName } = allToolCalls[i];
+    const { toolCallId, toolResult, toolName, isPlatformAuthoredResult } =
+      allToolCalls[i];
+    // A platform-authored result (dispatch error or seeded app render) never
+    // carries upstream data. Skip it — otherwise it has no trusted-data
+    // evaluation (or no matching policy) and falls through to the untrusted
+    // branch below, poisoning the session over a benign platform message.
+    if (isPlatformAuthoredResult) {
+      continue;
+    }
     // evaluateBulk() returns a Map keyed by the stringified input index, so we
     // read results back using the same positional key we submitted above.
     const evaluation = evaluationResults.get(i.toString());

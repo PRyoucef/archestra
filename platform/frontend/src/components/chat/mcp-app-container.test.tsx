@@ -1,7 +1,7 @@
 import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Mock heavy dependencies before module import ─────────────────────────────
 
@@ -82,6 +82,8 @@ vi.mock("@/components/mcp-app/app-settings-form", () => ({
 
 // ── Import component under test after mocks ───────────────────────────────────
 
+import { AppBridge } from "@modelcontextprotocol/ext-apps/app-bridge";
+import { McpAppRuntime } from "@/components/mcp-app/mcp-app-view";
 import { useApp } from "@/lib/app.query";
 import {
   clearAllAppDiagnostics,
@@ -1199,26 +1201,310 @@ describe("McpAppSection owned-app panel chrome", () => {
   });
 });
 
+describe("McpAppRuntime auth banner recovery", () => {
+  const AUTH_URL = "http://localhost:3000/mcp/registry?install=cat_test";
+  type CapturedBridge = {
+    oncalltool: ((params: { name: string }) => Promise<unknown>) | null;
+  };
+  type PendingToolCall = {
+    toolName: string;
+    respond: (result: unknown) => void;
+    reject: (error: unknown) => void;
+  };
+
+  let bridges: CapturedBridge[];
+  let pendingToolCalls: PendingToolCall[];
+  let restoreFetch: () => void;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    bridges = [];
+    pendingToolCalls = [];
+
+    (AppBridge as ReturnType<typeof vi.fn>).mockImplementation(function (
+      this: Record<string, unknown>,
+    ) {
+      this.onrequestdisplaymode = null;
+      this.onopenlink = null;
+      this.oncalltool = null;
+      this.onreadresource = null;
+      this.onlistresources = null;
+      this.onlistresourcetemplates = null;
+      this.onlistprompts = null;
+      this.onloggingmessage = null;
+      this.onmessage = null;
+      this.onsizechange = null;
+      this.oninitialized = null;
+      this.onsandboxready = null;
+      this.connect = vi.fn().mockResolvedValue(undefined);
+      this.sendSandboxResourceReady = vi.fn().mockResolvedValue(undefined);
+      this.sendToolInput = vi.fn().mockResolvedValue(undefined);
+      this.sendToolInputPartial = vi.fn().mockResolvedValue(undefined);
+      this.sendToolResult = vi.fn().mockResolvedValue(undefined);
+      this.setHostContext = vi.fn();
+      this.teardownResource = vi.fn().mockResolvedValue(undefined);
+      bridges.push(this as CapturedBridge);
+    });
+
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation((_input, init) => {
+        if (typeof init?.body !== "string") {
+          throw new Error("Expected a JSON-RPC request body");
+        }
+        const request = JSON.parse(init.body) as {
+          id: number;
+          params: { name: string };
+        };
+        return new Promise<Response>((resolve, reject) => {
+          pendingToolCalls.push({
+            toolName: request.params.name,
+            respond: (result) =>
+              resolve(
+                Response.json({ jsonrpc: "2.0", id: request.id, result }),
+              ),
+            reject,
+          });
+        });
+      });
+    restoreFetch = () => fetchSpy.mockRestore();
+  });
+
+  afterEach(() => restoreFetch());
+
+  it("clears a same-tool auth refusal after a newer success", async () => {
+    const bridge = await renderRuntime();
+    const authCall = callTool(bridge, "search");
+    await settleToolCall(0, authRequiredResult(), authCall);
+    expect(screen.getByRole("link")).toHaveAttribute("href", AUTH_URL);
+
+    const success = successfulResult();
+    const successCall = callTool(bridge, "search");
+    const outcome = await settleToolCall(1, success, successCall);
+
+    expect(outcome).toStrictEqual(success);
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+  });
+
+  it("keeps a refusal through ordinary errors and other-tool successes", async () => {
+    const bridge = await renderRuntime();
+    const authCall = callTool(bridge, "search");
+    await settleToolCall(0, authRequiredResult(), authCall);
+
+    const errorCall = callTool(bridge, "search");
+    await settleToolCall(1, ordinaryErrorResult(), errorCall);
+    expect(screen.getByRole("link")).toHaveAttribute("href", AUTH_URL);
+
+    const otherSuccess = callTool(bridge, "other");
+    await settleToolCall(2, successfulResult(), otherSuccess);
+    expect(screen.getByRole("link")).toHaveAttribute("href", AUTH_URL);
+  });
+
+  it("does not let newer ordinary failures suppress older auth refusals", async () => {
+    const user = userEvent.setup();
+    const bridge = await renderRuntime();
+
+    const olderAuth = callTool(bridge, "search");
+    const newerError = callTool(bridge, "search");
+    await settleToolCall(1, ordinaryErrorResult(), newerError);
+    await settleToolCall(0, authRequiredResult(), olderAuth);
+    expect(screen.getByRole("link")).toHaveAttribute("href", AUTH_URL);
+
+    await user.click(screen.getByRole("button", { name: "Dismiss" }));
+    const secondOlderAuth = callTool(bridge, "search");
+    const newerRejected = callTool(bridge, "search");
+    const requestError = new Error("Request failed");
+    expect(await rejectToolCall(3, requestError, newerRejected)).toBe(
+      requestError,
+    );
+    await settleToolCall(2, authRequiredResult(), secondOlderAuth);
+    expect(screen.getByRole("link")).toHaveAttribute("href", AUTH_URL);
+  });
+
+  it("refreshes identical-refusal ordering without replacing the banner", async () => {
+    const bridge = await renderRuntime();
+    const firstAuth = callTool(bridge, "search");
+    await settleToolCall(0, authRequiredResult(), firstAuth);
+    const firstLink = screen.getByRole("link");
+
+    const olderSuccess = callTool(bridge, "search");
+    const newerRepeatedAuth = callTool(bridge, "search");
+    await settleToolCall(2, authRequiredResult(), newerRepeatedAuth);
+    expect(screen.getByRole("link")).toBe(firstLink);
+    expect(screen.getAllByRole("link")).toHaveLength(1);
+
+    await settleToolCall(1, successfulResult(), olderSuccess);
+    expect(screen.getByRole("link")).toBe(firstLink);
+  });
+
+  it("orders both out-of-order completion directions by call generation", async () => {
+    const bridge = await renderRuntime();
+
+    const olderAuth = callTool(bridge, "search");
+    const newerSuccess = callTool(bridge, "search");
+    await settleToolCall(1, successfulResult(), newerSuccess);
+    await settleToolCall(0, authRequiredResult(), olderAuth);
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+
+    const olderSuccess = callTool(bridge, "search");
+    const newerAuth = callTool(bridge, "search");
+    await settleToolCall(3, authRequiredResult(), newerAuth);
+    await settleToolCall(2, successfulResult(), olderSuccess);
+    expect(screen.getByRole("link")).toHaveAttribute("href", AUTH_URL);
+  });
+
+  it("ignores a late settlement from a replaced bridge", async () => {
+    const rendered = render(runtimeNode("app-1"));
+    await vi.waitFor(() => expect(bridges).toHaveLength(1));
+    const staleCall = callTool(bridges[0], "search");
+
+    rendered.rerender(runtimeNode("app-2"));
+    await vi.waitFor(() => expect(bridges).toHaveLength(2));
+    const staleResult = authRequiredResult();
+    const outcome = await settleToolCall(0, staleResult, staleCall);
+
+    expect(outcome).toStrictEqual(staleResult);
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+  });
+
+  async function renderRuntime(): Promise<CapturedBridge> {
+    render(runtimeNode("app-1"));
+    await vi.waitFor(() => expect(bridges).toHaveLength(1));
+    return bridges[0];
+  }
+
+  function runtimeNode(appId: string) {
+    return (
+      <McpAppRuntime
+        toolResourceUri="ui://test/app"
+        endpoint={{ kind: "app", appId }}
+        displayMode="inline"
+        onDisplayModeChange={vi.fn()}
+        onSizeChange={vi.fn()}
+        onResourceStateChange={vi.fn()}
+        preloadedResource={preloadedResource}
+      />
+    );
+  }
+
+  function callTool(bridge: CapturedBridge, name: string): Promise<unknown> {
+    if (!bridge.oncalltool)
+      throw new Error("Bridge tool callback not installed");
+    return bridge.oncalltool({ name });
+  }
+
+  async function settleToolCall(
+    index: number,
+    result: unknown,
+    call: Promise<unknown>,
+  ): Promise<unknown> {
+    let outcome: unknown;
+    await act(async () => {
+      pendingToolCalls[index].respond(result);
+      outcome = await call;
+    });
+    return outcome;
+  }
+
+  async function rejectToolCall(
+    index: number,
+    error: unknown,
+    call: Promise<unknown>,
+  ): Promise<unknown> {
+    let rejection: unknown;
+    await act(async () => {
+      pendingToolCalls[index].reject(error);
+      try {
+        await call;
+      } catch (caught) {
+        rejection = caught;
+      }
+    });
+    return rejection;
+  }
+
+  function authRequiredResult() {
+    return {
+      isError: true,
+      content: [{ type: "text", text: "Authentication required" }],
+      _meta: {
+        archestraError: {
+          type: "auth_required",
+          message: "Authentication required",
+          catalogName: "Test catalog",
+          catalogId: "cat_test",
+          action: "install_mcp_credentials",
+          actionUrl: AUTH_URL,
+        },
+      },
+    };
+  }
+
+  function successfulResult() {
+    return { content: [{ type: "text", text: "ok" }] };
+  }
+
+  function ordinaryErrorResult() {
+    return {
+      isError: true,
+      content: [{ type: "text", text: "Tool failed" }],
+    };
+  }
+});
+
 describe("McpAppSection error handling", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it("shows error message when fetch fails (no preloaded resource)", async () => {
-    // Mock global fetch to simulate a network error
+  it("degrades silently for a third-party app when the UI resource can't be read", async () => {
+    // A third-party tool advertises a ui:// resource its upstream server can't
+    // serve (e.g. -32601 Method not found). The tool result is shown regardless,
+    // so the failed app load must fold away rather than show a "Failed to load
+    // app" card. defaultProps is an agent (third-party) render — no appId.
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(new Error("MCP error -32601: Method not found"));
+
+    await act(async () => {
+      render(
+        <McpAppSection
+          {...defaultProps}
+          toolDetails={<div data-testid="tool-details">details</div>}
+        />,
+      );
+    });
+
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    // Flush the rejection handler + re-render.
+    await act(async () => {});
+
+    expect(screen.queryByText(/failed to load app/i)).not.toBeInTheDocument();
+    expect(document.querySelector("iframe")).not.toBeInTheDocument();
+    // The app folded away, but its tool-call details stay inspectable.
+    expect(screen.getByTestId("tool-details")).toBeInTheDocument();
+
+    fetchSpy.mockRestore();
+  });
+
+  it("shows the error for an owned app when the UI resource can't be read", async () => {
+    // Owned (Archestra-authored) apps do not degrade: a load failure is an
+    // authoring bug the author needs to see, so the error card stays.
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
       .mockRejectedValue(new Error("Network error"));
 
     await act(async () => {
-      render(<McpAppSection {...defaultProps} />);
+      render(
+        <McpAppSection
+          {...defaultProps}
+          appId="11111111-1111-1111-1111-111111111111"
+        />,
+      );
     });
 
-    // Wait for the async fetch to complete and error state to render
     await vi.waitFor(() => {
-      expect(
-        screen.getByText(/failed to load/i) || screen.getByText(/error/i),
-      ).toBeTruthy();
+      expect(screen.getByText(/failed to load app/i)).toBeInTheDocument();
     });
 
     fetchSpy.mockRestore();

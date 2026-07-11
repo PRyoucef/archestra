@@ -14,6 +14,7 @@ import {
   MCP_SERVER_TOOL_NAME_SEPARATOR,
   type McpToolError,
   parseFullToolName,
+  SEEDED_APP_RENDER_META_KEY,
   TimeInMs,
 } from "@archestra/shared";
 import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
@@ -602,30 +603,46 @@ class McpClient {
           options?.elicitationHandler,
         );
 
-        // Determine the actual tool name by stripping the server/catalog prefix.
-        // We prioritize the `catalogName` prefix, which is standard for local MCP servers.
-        // If the tool name doesn't match the catalog prefix, we fall back to the resolved `mcpServerName`.
-        let targetToolName = this.stripServerPrefix(
-          toolCall.name,
-          tool.catalogName || "",
-        );
+        // Determine the actual upstream tool name. Prefer the stored raw name
+        // (tools.raw_name): it is exact even when the slug's server-prefix was
+        // truncated to fit the 64-char cap or the raw name itself contains the
+        // `__` separator. Fall back to prefix-stripping the slug for legacy rows
+        // whose raw_name has not been backfilled/re-synced yet.
+        let targetToolName: string;
+        if (tool.rawName) {
+          targetToolName = tool.rawName;
+        } else {
+          // We prioritize the `catalogName` prefix, which is standard for local
+          // MCP servers. If the tool name doesn't match the catalog prefix, we
+          // fall back to the resolved `mcpServerName`.
+          targetToolName = this.stripServerPrefix(
+            toolCall.name,
+            tool.catalogName || "",
+          );
 
-        if (targetToolName === toolCall.name) {
-          // No prefix match with catalogName; attempt to strip using mcpServerName instead.
-          targetToolName = this.stripServerPrefix(toolCall.name, mcpServerName);
-        }
+          if (targetToolName === toolCall.name) {
+            // No prefix match with catalogName; attempt to strip using mcpServerName instead.
+            targetToolName = this.stripServerPrefix(
+              toolCall.name,
+              mcpServerName,
+            );
+          }
 
-        if (targetToolName === toolCall.name) {
-          // Neither prefix matched (e.g. server name contains MCP_SERVER_TOOL_NAME_SEPARATOR separator).
-          // Fall back to parseFullToolName which uses lastIndexOf to split correctly.
-          targetToolName = parseFullToolName(toolCall.name).toolName;
+          if (targetToolName === toolCall.name) {
+            // Neither prefix matched (e.g. server name contains MCP_SERVER_TOOL_NAME_SEPARATOR separator).
+            // Fall back to parseFullToolName which uses lastIndexOf to split correctly.
+            targetToolName = parseFullToolName(toolCall.name).toolName;
+          }
         }
 
         const resourceUri = getSyntheticResourceToolUri(tool.meta);
         if (resourceUri) {
           const result = await client.readResource(
             { uri: resourceUri },
-            { signal: options?.abortSignal },
+            {
+              signal: options?.abortSignal,
+              timeout: config.mcpGateway.toolCallTimeoutMs,
+            },
           );
           return await this.createSuccessResult({
             toolCall,
@@ -662,7 +679,10 @@ class McpClient {
             arguments: toolCall.arguments,
           },
           undefined,
-          { signal: options?.abortSignal },
+          {
+            signal: options?.abortSignal,
+            timeout: config.mcpGateway.toolCallTimeoutMs,
+          },
         );
 
         const isOAuthServer = !!catalogItem.oauthConfig;
@@ -1331,17 +1351,18 @@ class McpClient {
       tool = undefined;
     }
 
-    // Dynamic tool access ("All tools" mode): the dispatcher pre-resolved a
+    // Dynamic tool access ("Auto" mode): the dispatcher pre-resolved a
     // tool the agent has no assignment row for. Shape it like an assignment so
     // downstream resolution is identical. It has no row to inherit a credential
     // mode from and can't carry a static pin, so it resolves its connection at
     // call time — which still defers to the MCP server's connection policy
     // (on-behalf-of the caller, or a pinned service account). An assigned row
-    // keeps precedence here; in "All tools" mode the override below then routes
+    // keeps precedence here; in "Auto" mode the override below then routes
     // even a leftover static assignment through the server's connection policy.
     if (!tool && availableTool && availableTool.name === toolCall.name) {
       tool = {
         toolName: availableTool.name,
+        rawName: availableTool.rawName,
         mcpServerId: null,
         credentialResolutionMode: "dynamic",
         catalogId: availableTool.catalogId,
@@ -1400,7 +1421,7 @@ class McpClient {
       };
     }
 
-    // "All tools" mode overrides a leftover per-tool credential pin. When the
+    // "Auto" mode overrides a leftover per-tool credential pin. When the
     // agent has access_all_tools on, credentials follow the MCP server's
     // connection policy (on-behalf-of the caller, or a pinned service account)
     // for every tool — a static assignment left over from Custom mode must not
@@ -1414,7 +1435,7 @@ class McpClient {
           agentId: owner.id,
           mcpServerId: tool.mcpServerId,
         },
-        "All-tools mode: ignoring static assignment pin, resolving via the MCP server's connection policy",
+        "Auto tool mode: ignoring static assignment pin, resolving via the MCP server's default-credential policy",
       );
       tool = {
         ...tool,
@@ -1743,21 +1764,35 @@ class McpClient {
       };
     }
 
-    // Fallback for external IdP users if earlier resolution didn't match
+    // Fallback for external IdP users if earlier resolution didn't match.
+    // Another user's personal install is never eligible — its stored
+    // credentials must not serve other callers; JWKS deployments share
+    // org/team-scoped installs (or ownerless service rows).
     // TODO: works only we are doing end-to-end JWKS pattern.
-    if (tokenAuth.isExternalIdp && allServers.length > 0) {
-      logger.info(
-        {
-          toolName: toolCall.name,
-          catalogId: tool.catalogId,
-          serverId: allServers[0].id,
-        },
-        `Dynamic resolution: using first available server for external IdP user`,
+    if (tokenAuth.isExternalIdp) {
+      const idpFallbackServer = allServers.find(
+        (s) =>
+          !(
+            s.ownerId &&
+            s.ownerId !== tokenAuth.userId &&
+            !s.teamId &&
+            s.scope !== "org"
+          ),
       );
-      return {
-        targetMcpServerId: allServers[0].id,
-        mcpServerName: allServers[0].name,
-      };
+      if (idpFallbackServer) {
+        logger.info(
+          {
+            toolName: toolCall.name,
+            catalogId: tool.catalogId,
+            serverId: idpFallbackServer.id,
+          },
+          `Dynamic resolution: using first available server for external IdP user`,
+        );
+        return {
+          targetMcpServerId: idpFallbackServer.id,
+          mcpServerName: idpFallbackServer.name,
+        };
+      }
     }
 
     // No server found. Offer a self-service install link only when the caller
@@ -2335,13 +2370,19 @@ class McpClient {
       structuredContent,
     } = opts;
 
+    // `archestraError` and the seeded-app-render marker are platform-reserved
+    // envelopes: error renderers and the trusted-data guardrail key off them to
+    // identify platform-authored results. Only the platform sets them, so strip
+    // any copy an upstream tool put in its result metadata — otherwise a
+    // hostile server could forge a dispatch error or a seeded-render marker and
+    // slip untrusted output past the injection scan.
     const toolResult: CommonToolResult = {
       id: toolCall.id,
       name: toolCall.name,
       content,
       isError,
-      _meta,
-      structuredContent,
+      _meta: stripReservedPlatformMeta(_meta),
+      structuredContent: stripReservedPlatformMeta(structuredContent),
     };
 
     await this.persistToolCall(
@@ -3175,11 +3216,15 @@ class McpClient {
         throw new Error("toolName is required for tools/call");
       }
       return await this.raceWithTimeout(
-        client.callTool({
-          name: params.toolName,
-          arguments: params.toolArguments ?? {},
-        }),
-        60000,
+        client.callTool(
+          {
+            name: params.toolName,
+            arguments: params.toolArguments ?? {},
+          },
+          undefined,
+          { timeout: config.mcpGateway.toolCallTimeoutMs },
+        ),
+        config.mcpGateway.toolCallTimeoutMs,
         "Tool call timeout",
       );
     } finally {
@@ -3259,11 +3304,15 @@ class McpClient {
   }): Promise<unknown> {
     return this.withDirectServerClient(params.mcpServerId, (client) =>
       this.raceWithTimeout(
-        client.callTool({
-          name: params.name,
-          arguments: params.arguments ?? {},
-        }),
-        60000,
+        client.callTool(
+          {
+            name: params.name,
+            arguments: params.arguments ?? {},
+          },
+          undefined,
+          { timeout: config.mcpGateway.toolCallTimeoutMs },
+        ),
+        config.mcpGateway.toolCallTimeoutMs,
         "Tool call timeout",
       ),
     );
@@ -4090,6 +4139,33 @@ function isAuthRelatedError(errorMessage: string): boolean {
     lower.includes("invalid credentials") ||
     lower.includes("credentials expired")
   );
+}
+
+// Platform-reserved metadata keys: `archestraError` (set only by
+// createErrorResult) and the seeded-app-render marker (set only by the
+// open-in-chat conversation seeding). Renderers and the trusted-data guardrail
+// key off them to identify platform-authored results.
+const RESERVED_PLATFORM_META_KEYS = [
+  "archestraError",
+  SEEDED_APP_RENDER_META_KEY,
+] as const;
+
+// Remove platform-reserved keys from tool-supplied metadata so they can only
+// ever be present when the platform itself authored them — otherwise a hostile
+// server could forge a dispatch error or a seeded-render marker and slip
+// untrusted output past the injection scan. Returns the same reference when
+// nothing was stripped.
+function stripReservedPlatformMeta(
+  meta: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!meta || !RESERVED_PLATFORM_META_KEYS.some((key) => key in meta)) {
+    return meta;
+  }
+  const rest = { ...meta };
+  for (const key of RESERVED_PLATFORM_META_KEYS) {
+    delete rest[key];
+  }
+  return rest;
 }
 
 function isAuthRelatedToolResult(result: {

@@ -48,7 +48,7 @@ import {
   type SpanTeamInfo,
   startActiveMcpSpan,
 } from "@/observability/tracing";
-import type { UnsafeContextBoundary } from "@/types";
+import type { Tool as CatalogTool, UnsafeContextBoundary } from "@/types";
 import { agentOwner, UNSAFE_CONTEXT_BOUNDARY_REASON } from "@/types";
 
 /** Gateway token selected for the current call (see selectMCPGatewayToken). */
@@ -119,6 +119,16 @@ export function buildMcpGatewayTool(params: {
 }): Tool {
   const { mcpTool, ctx } = params;
   const normalizedSchema = normalizeJsonSchema(mcpTool.inputSchema);
+  // Only UI-providing tools are advertised top-level unassigned, so only they
+  // need the (DB-heavy) dynamic resolution at call time. The gateway emits the
+  // same `_meta.ui.resourceUri` it lists top-level with, so this build-time flag
+  // matches what resolveDynamicTool would find — computed once here to keep the
+  // resolution off the hot path for ordinary assigned tools.
+  const isUiProvidingTool = metaProvidesUiResource(
+    mcpTool._meta as
+      | { ui?: { resourceUri?: unknown }; "ui/resourceUri"?: unknown }
+      | undefined,
+  );
 
   return {
     description: mcpTool.description || `Tool: ${mcpTool.name}`,
@@ -207,6 +217,9 @@ export function buildMcpGatewayTool(params: {
                 abortSignal: ctx.abortSignal,
                 elicitation: ctx.elicitation,
                 contextIsTrusted: toolExecutionContext.contextIsTrusted,
+                // `run_tool` can dispatch a delegation tool, so this context
+                // needs the caller's ancestors for the executor's cycle check.
+                delegationChain: ctx.delegationChain,
                 approvalRequiredPoliciesHandled: true,
                 tokenAuth: buildTokenAuthContext({
                   mcpGwToken: ctx.mcpGwToken,
@@ -272,6 +285,7 @@ export function buildMcpGatewayTool(params: {
               considerContextUntrusted: ctx.considerContextUntrusted,
               abortSignal: ctx.abortSignal,
               elicitation: ctx.elicitation,
+              isUiProvidingTool,
             });
           }
 
@@ -594,6 +608,15 @@ export async function buildArchestraToolOutput(params: {
       "Failed to fetch dispatched tool definition meta",
     );
   }
+  // Drop the resource when its upstream server can't actually serve it (e.g.
+  // -32601), so the dispatch falls through to the plain-result handling below
+  // instead of registering an app that renders nothing. See uiResourceIsReadable.
+  if (
+    resourceUri &&
+    !(await uiResourceIsReadable({ uri: resourceUri, agentId, tokenAuth }))
+  ) {
+    resourceUri = undefined;
+  }
   if (!resourceUri) {
     // A dispatched third-party tool with no MCP-App UI. If it returned a
     // structured Archestra error (e.g. the expired-auth re-auth payload),
@@ -799,6 +822,12 @@ interface ToolExecutionContext {
   considerContextUntrusted: boolean;
   abortSignal?: AbortSignal;
   elicitation?: ChatMcpElicitationBridge;
+  /**
+   * Set when the tool's gateway-listed definition carries a `ui://` resource,
+   * i.e. it may be advertised top-level while unassigned. Gates the dynamic
+   * availableTool resolution so ordinary assigned tools skip its DB lookups.
+   */
+  isUiProvidingTool?: boolean;
 }
 
 /**
@@ -830,6 +859,7 @@ async function executeMcpTool(ctx: ToolExecutionContext): Promise<{
     mcpGwToken,
     abortSignal,
     elicitation,
+    isUiProvidingTool,
   } = ctx;
   throwIfAborted(abortSignal);
   const startTime = Date.now();
@@ -869,21 +899,51 @@ async function executeMcpTool(ctx: ToolExecutionContext): Promise<{
     arguments: toolArguments ?? {},
   };
 
+  // An all-tools agent advertises unassigned UI-providing tools (app/external
+  // launch tools) top-level so a model can call one directly — an MCP-App host
+  // renders a UI only from a tool listed at discovery time, never from a
+  // run_tool result. Dispatch accepts an unassigned tool only via a pre-resolved
+  // availableTool, so resolve it exactly as the gateway CallTool handler and
+  // run_tool do (resolveDynamicTool self-gates on the agent's all-tools
+  // setting), gated to the UI-providing subset: only that subset is listed
+  // top-level, so resolving anything else would make a hidden tool name directly
+  // executable. isUiProvidingTool (from the gateway-listed `_meta`) keeps the
+  // DB-heavy resolution off the hot path for ordinary assigned tools, which
+  // never carry a `ui://` resource and would discard the result at the guard
+  // below anyway.
+  let availableTool: CatalogTool | undefined;
+  if (isUiProvidingTool && userId && organizationId) {
+    const dynamicTool = await resolveDynamicTool({
+      toolName,
+      agentId,
+      userId,
+      organizationId,
+    });
+    if (dynamicTool && toolProvidesUiResource(dynamicTool)) {
+      availableTool = dynamicTool;
+    }
+  }
+
+  // Caller auth for install resolution (own→team→org), reused below to verify a
+  // declared UI resource is readable with the exact same scoping the execution used.
+  const tokenAuthContext = mcpGwToken
+    ? {
+        tokenId: mcpGwToken.tokenId,
+        teamId: mcpGwToken.teamId,
+        isOrganizationToken: mcpGwToken.isOrganizationToken,
+        organizationId,
+        userId,
+      }
+    : undefined;
+
   let result: Awaited<ReturnType<typeof mcpClient.executeToolCallForOwner>>;
   try {
     result = await mcpClient.executeToolCallForOwner(
       toolCall,
       agentOwner(agentId),
-      mcpGwToken
-        ? {
-            tokenId: mcpGwToken.tokenId,
-            teamId: mcpGwToken.teamId,
-            isOrganizationToken: mcpGwToken.isOrganizationToken,
-            organizationId,
-            userId,
-          }
-        : undefined,
+      tokenAuthContext,
       {
+        ...(availableTool ? { availableTool } : {}),
         // mcp-client scopes per-conversation sessions by this key; in UI chat it
         // is the conversation id, in headless executions the execution key.
         conversationId: isolationKey,
@@ -1030,6 +1090,27 @@ async function executeMcpTool(ctx: ToolExecutionContext): Promise<{
     );
   }
 
+  // A tool definition can declare a `ui://` MCP App resource its upstream server
+  // never actually serves (e.g. resources/read → -32601 Method not found).
+  // Keeping it would register an app that renders nothing — an empty pill and an
+  // auto-opened, blank right panel — so drop the declared resource when it can't
+  // be read, letting the tool render as a plain call. An embedded inline resource
+  // (below) is self-contained and re-synthesizes the ui after this check.
+  const declaredUiResourceUri = toolDefinitionMeta?.ui?.resourceUri;
+  if (
+    declaredUiResourceUri &&
+    toolDefinitionMeta?.ui &&
+    !(await uiResourceIsReadable({
+      uri: declaredUiResourceUri,
+      agentId,
+      tokenAuth: tokenAuthContext,
+    }))
+  ) {
+    const { resourceUri: _unreadable, ...uiWithoutResource } =
+      toolDefinitionMeta.ui;
+    toolDefinitionMeta = { ...toolDefinitionMeta, ui: uiWithoutResource };
+  }
+
   // Check for embedded resources (type: "resource" content items with UI resources)
   // MCP servers can return UI resources inline in tool results as an alternative to
   // declaring _meta.ui.resourceUri in tool definitions. Both patterns are standard MCP.
@@ -1103,6 +1184,65 @@ function resolveRunToolTargetName(toolName: string, args: unknown): string {
     : toolName;
 }
 
+// Whether a tool's `_meta` carries an MCP App `ui://` resource — the subset
+// advertised top-level and therefore directly dispatchable. Mirrors
+// `providesUiResource` in the gateway's tools/list builder; kept local to avoid
+// a clients → routes import.
+function metaProvidesUiResource(
+  meta:
+    | { ui?: { resourceUri?: unknown }; "ui/resourceUri"?: unknown }
+    | null
+    | undefined,
+): boolean {
+  const isUiUri = (value: unknown): boolean =>
+    typeof value === "string" && value.startsWith("ui://");
+  return isUiUri(meta?.ui?.resourceUri) || isUiUri(meta?.["ui/resourceUri"]);
+}
+
+/**
+ * Whether an MCP App `ui://` UI resource can actually be read from its upstream
+ * server. A tool may advertise a resource its server never implements
+ * (`resources/read` → -32601 Method not found) or otherwise can't serve;
+ * attaching such a resource to a tool result makes chat register an app that
+ * renders nothing — an empty pill plus an auto-opened, blank right panel. Both
+ * enrichment paths (executeMcpTool and buildArchestraToolOutput) gate the
+ * attachment on this, mirroring the SSE prefetch's own readability gate
+ * (tool-ui-stream). A successful read is cached, so the frontend's later render
+ * reuses it rather than re-reading.
+ */
+async function uiResourceIsReadable(params: {
+  uri: string;
+  agentId: string;
+  tokenAuth?: TokenAuthContext;
+}): Promise<boolean> {
+  try {
+    await mcpClient.readResource(params.uri, params.agentId, params.tokenAuth);
+    return true;
+  } catch (error) {
+    logger.debug(
+      { error, uri: params.uri, agentId: params.agentId },
+      "MCP App UI resource unreadable; rendering as a plain tool call",
+    );
+    return false;
+  }
+}
+
+// The resolved catalog tool nests its MCP `_meta` one level down under `meta`.
+function toolProvidesUiResource(tool: CatalogTool): boolean {
+  const meta = (
+    tool.meta as
+      | {
+          _meta?: {
+            ui?: { resourceUri?: unknown };
+            "ui/resourceUri"?: unknown;
+          };
+        }
+      | null
+      | undefined
+  )?._meta;
+  return metaProvidesUiResource(meta);
+}
+
 async function buildUnsafeContextBoundaryResult(params: {
   resultMeta?: Record<string, unknown>;
   toolCallId: string;
@@ -1114,6 +1254,22 @@ async function buildUnsafeContextBoundaryResult(params: {
   _meta?: Record<string, unknown>;
   unsafeContextBoundary?: UnsafeContextBoundary;
 }> {
+  // A platform dispatch error (tool_state, e.g. unknown_tool) never reached an
+  // upstream tool, so its result is platform-authored text with no external
+  // data — never mark the context unsafe for it. Mirrors the trusted-data bulk
+  // re-evaluation, which exempts the same envelopes; without both, a benign
+  // unresolved-tool error poisons the session and blocks the next legit call.
+  if (
+    extractMcpToolError({
+      _meta: params.resultMeta,
+      content: params.toolOutput,
+    })?.type === "tool_state"
+  ) {
+    return params.resultMeta && Object.keys(params.resultMeta).length > 0
+      ? { _meta: params.resultMeta }
+      : {};
+  }
+
   const unsafeContextBoundary =
     await evaluateUnsafeContextBoundaryForToolResult(params);
   const mergedMeta = unsafeContextBoundary

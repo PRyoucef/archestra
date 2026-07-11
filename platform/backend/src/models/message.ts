@@ -1,6 +1,6 @@
-import { and, eq, gt, inArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, or, sql } from "drizzle-orm";
 import db, { schema, withDbTransaction } from "@/database";
-import type { InsertMessage, Message } from "@/types";
+import { ApiError, type InsertMessage, type Message } from "@/types";
 import { isUuid, uuidv7 } from "@/utils/uuid";
 
 type DbExecutor =
@@ -143,6 +143,71 @@ class MessageModel {
     return MessageModel.findByContentId(id);
   }
 
+  /**
+   * Like findByAnyId, but scoped to a single conversation. Content IDs are
+   * client-supplied and carry no uniqueness guarantee across conversations,
+   * so callers that know the conversation must scope the lookup to it.
+   */
+  static async findByAnyIdInConversation(
+    id: string,
+    conversationId: string,
+  ): Promise<Message | null> {
+    if (isUuid(id)) {
+      const [byDbId] = await db
+        .select()
+        .from(schema.messagesTable)
+        .where(
+          and(
+            eq(schema.messagesTable.id, id),
+            eq(schema.messagesTable.conversationId, conversationId),
+          ),
+        );
+      if (byDbId) return byDbId;
+    }
+
+    // Content IDs carry no uniqueness guarantee even within one conversation
+    // (client-supplied), so pick the newest match deterministically instead of
+    // whatever row the planner returns first.
+    const [byContentId] = await db
+      .select()
+      .from(schema.messagesTable)
+      .where(
+        and(
+          sql`${schema.messagesTable.content}->>'id' = ${id}`,
+          eq(schema.messagesTable.conversationId, conversationId),
+        ),
+      )
+      .orderBy(
+        desc(schema.messagesTable.createdAt),
+        desc(schema.messagesTable.id),
+      )
+      .limit(1);
+
+    return byContentId || null;
+  }
+
+  /**
+   * Set or clear the owner's feedback on a message. Deliberately does not
+   * touch the conversation's recency — a rating is not new activity.
+   * Returns null when the row vanished between lookup and update (e.g. a
+   * concurrent regeneration deleted it).
+   */
+  static async updateFeedback(
+    messageId: string,
+    feedback: Message["feedback"],
+  ): Promise<Message | null> {
+    const [updatedMessage] = await db
+      .update(schema.messagesTable)
+      .set({
+        feedback,
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.messagesTable.id, messageId))
+      .returning();
+
+    return updatedMessage || null;
+  }
+
   static async updateTextPart(
     messageId: string,
     partIndex: number,
@@ -152,7 +217,7 @@ class MessageModel {
     const message = await MessageModel.findById(messageId);
 
     if (!message) {
-      throw new Error("Message not found");
+      throw new ApiError(404, "Message not found");
     }
 
     // biome-ignore lint/suspicious/noExplicitAny: UIMessage content is dynamic
@@ -160,13 +225,14 @@ class MessageModel {
 
     // Validate that the part exists
     if (!content.parts?.[partIndex]) {
-      throw new Error("Invalid part index");
+      throw new ApiError(400, "Invalid part index");
     }
 
     // Validate that the part is a text part to prevent data corruption
     // Only text parts can have their text property modified
     if (content.parts[partIndex].type !== "text") {
-      throw new Error(
+      throw new ApiError(
+        400,
         `Cannot update non-text part: part at index ${partIndex} is of type "${content.parts[partIndex].type}"`,
       );
     }
@@ -288,7 +354,7 @@ class MessageModel {
         .where(eq(schema.messagesTable.id, messageId));
 
       if (!message) {
-        throw new Error("Message not found");
+        throw new ApiError(404, "Message not found");
       }
 
       // biome-ignore lint/suspicious/noExplicitAny: UIMessage content is dynamic
@@ -296,12 +362,13 @@ class MessageModel {
 
       // Validate that the part exists
       if (!content.parts?.[partIndex]) {
-        throw new Error("Invalid part index");
+        throw new ApiError(400, "Invalid part index");
       }
 
       // Validate that the part is a text part to prevent data corruption
       if (content.parts[partIndex].type !== "text") {
-        throw new Error(
+        throw new ApiError(
+          400,
           `Cannot update non-text part: part at index ${partIndex} is of type "${content.parts[partIndex].type}"`,
         );
       }

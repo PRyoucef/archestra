@@ -188,7 +188,10 @@ export async function createAgentServer(
   );
   const { server } = mcpServer;
 
-  const agent = await AgentModel.findById(agentId);
+  // Slim lookup: this runs on every stateless gateway request, and the tool
+  // handlers below only read scalar agent config plus labels — never the
+  // tools/teams/knowledge/connector hydration `findById` performs.
+  const agent = await AgentModel.findGatewayAgentById(agentId);
   if (!agent) throw new Error(`Agent not found: ${agentId}`);
 
   // Fetch the agent's teams and the calling user's teams (with labels) for
@@ -223,19 +226,36 @@ export async function createAgentServer(
     const { tools: mcpTools, exclusionSets } =
       await agentToolExclusionsService.getFilteredMcpToolsByAgent(agentId);
 
-    // An all-tools agent reaches unassigned tools dynamically (search_tools /
-    // run_tool already resolve them without an agent_tools row). A UI-providing
-    // tool reached only that way would otherwise never become a candidate below,
-    // so filterExposedTools' "keep top-level" check never runs on it — and an
-    // MCP Apps host, which renders a UI only from a tool DEFINITION listed at
-    // tools/list time (never from a run_tool call result), could never discover
-    // or render it. Widen the candidate pool with the caller's dynamically
-    // accessible UI-providing tools so they get the same top-level treatment as
-    // an assigned one. Gated strictly on accessAllTools (not toolExposureMode
-    // alone) — a search_and_run_only agent without it is deliberately scoped to
-    // its assigned set for context-window management, not dynamic reach.
+    // A tools/list is served to one of two surfaces, and the whole gateway/chat
+    // difference lives in this policy. An internal chat (agentType "agent") is
+    // host and server both: it mounts an app from the tool RESULT — render_app
+    // for owned apps, run_tool for any UI tool — resolving the `ui://` resource
+    // from its own catalog, so it advertises render_app and NO UI-providing tool,
+    // keeping the list compact regardless of dynamic reach. An external MCP client
+    // on any other surface (mcp_gateway, legacy profile) renders only from a
+    // discovery-time tool DEFINITION (per the MCP Apps extension), so it must
+    // advertise UI-providing tools — both assigned and dynamically-reached, which
+    // have no agent_tools row — and drops render_app, which no-ops for it. The
+    // three flags are independently motivated; they coincide on agentType, the
+    // surface signal this codebase keys on throughout.
+    const surface =
+      agent.agentType === "agent"
+        ? {
+            widenDynamicUiTools: false,
+            advertiseUiTools: false,
+            keepRenderApp: true,
+          }
+        : {
+            widenDynamicUiTools: true,
+            advertiseUiTools: true,
+            keepRenderApp: false,
+          };
+
     const dynamicUiTools = (
-      agent.accessAllTools && tokenAuth?.userId && tokenAuth.organizationId
+      agent.accessAllTools &&
+      surface.widenDynamicUiTools &&
+      tokenAuth?.userId &&
+      tokenAuth.organizationId
         ? await ToolModel.getMcpToolsAccessibleToUser({
             userId: tokenAuth.userId,
             organizationId: tokenAuth.organizationId,
@@ -267,25 +287,16 @@ export async function createAgentServer(
     );
     const exposureFiltered = filterExposedTools({
       toolExposureMode: agent.toolExposureMode ?? "full",
+      advertiseUiResourceTools: surface.advertiseUiTools,
       tools: candidateTools.filter((t) => permittedNames.has(t.name)),
     });
-    // render_app renders only inside Archestra's own chat (the chat frontend
-    // mounts the app from the tool result); on an external MCP host it renders
-    // nothing while its result text reads as success, so models keep picking
-    // it over the app's own __open launch tool — the only path that renders
-    // there. Only chat ("agent"-type) agents keep the tool: every other agent
-    // type (mcp_gateway, legacy profile) is an external connection surface.
-    // The rest of the authoring surface (scaffold/read/edit/validate) works
-    // from external clients and stays. The render_app handler itself steers
-    // external callers the same way, since run_tool can still dispatch it.
-    const permittedTools =
-      agent.agentType !== "agent"
-        ? exposureFiltered.filter(
-            (tool) =>
-              archestraMcpBranding.getToolShortName(tool.name) !==
-              TOOL_RENDER_APP_SHORT_NAME,
-          )
-        : exposureFiltered;
+    const permittedTools = surface.keepRenderApp
+      ? exposureFiltered
+      : exposureFiltered.filter(
+          (tool) =>
+            archestraMcpBranding.getToolShortName(tool.name) !==
+            TOOL_RENDER_APP_SHORT_NAME,
+        );
 
     // Resolve the backing catalogs of the assigned tools once: their names feed
     // both the search_tools description and the app launch-tool titles below.
@@ -396,19 +407,29 @@ export async function createAgentServer(
         );
         return result;
       } catch (error) {
-        logger.error(
-          {
-            agentId,
-            uri,
-            error: error instanceof Error ? error.message : "Unknown error",
-            stack: error instanceof Error ? error.stack : undefined,
-          },
-          "Resource read failed",
-        );
+        // A third-party tool can advertise a `ui://` UI resource whose upstream
+        // server does not actually implement `resources/read` (returning -32601
+        // Method not found) or has no such resource. That is an expected upstream
+        // limitation, not a platform fault — the client degrades to the plain
+        // tool result — so log it at a lower severity to avoid flooding error
+        // logs. Genuine failures still log at error.
+        const message =
+          error instanceof Error ? error.message : "Unknown error";
+        const logContext = {
+          agentId,
+          uri,
+          error: message,
+          stack: error instanceof Error ? error.stack : undefined,
+        };
+        if (isUnavailableResourceError(error)) {
+          logger.info(logContext, "Resource read unavailable (upstream)");
+        } else {
+          logger.error(logContext, "Resource read failed");
+        }
         throw {
           code: -32603,
           message: "Resource read failed",
-          data: error instanceof Error ? error.message : "Unknown error",
+          data: message,
         };
       }
     },
@@ -1446,7 +1467,7 @@ export async function validateExternalIdpToken(
 ): Promise<TokenAuthResult | null> {
   try {
     // Look up the agent to check if it has an identity provider configured
-    const agent = await AgentModel.findById(profileId);
+    const agent = await AgentModel.findGatewayAgentById(profileId);
     if (!agent?.identityProviderId) {
       return null;
     }
@@ -1789,20 +1810,23 @@ export async function buildKnowledgeSourcesDescription(
 
 function filterExposedTools(params: {
   toolExposureMode: ToolExposureMode;
+  advertiseUiResourceTools: boolean;
   tools: McpListToolCandidate[];
 }) {
-  const { toolExposureMode, tools } = params;
+  const { toolExposureMode, advertiseUiResourceTools, tools } = params;
   return tools.filter((tool) => {
     // `search_and_run_only` normally hides every tool behind search_tools/run_tool,
     // but the meta tools themselves and the always-exposed skill path must stay
     // top-level. UI-providing tools (app launch tools, external ext-apps tools)
-    // must too: an MCP Apps host renders a UI only from a tool DEFINITION listed
-    // at discovery time, so a tool hidden behind search/run can never render its
-    // `ui://` resource. `full` mode hides only the meta tools.
+    // stay too ONLY on a surface that advertises them: an MCP Apps host renders a
+    // UI from a tool DEFINITION listed at discovery time, so a gateway must keep
+    // it top-level; the chat surface renders from the tool result instead, so it
+    // reaches UI tools through search_tools/run_tool and keeps its list compact.
+    // `full` mode hides only the meta tools.
     return toolExposureMode === "search_and_run_only"
       ? isArchestraMetaTool(tool.name) ||
           isAlwaysExposedTool(tool.name) ||
-          providesUiResource(tool)
+          (advertiseUiResourceTools && providesUiResource(tool))
       : !isArchestraMetaTool(tool.name);
   });
 }
@@ -2004,4 +2028,26 @@ function providesUiResource(tool: {
   const isUiUri = (value: unknown): boolean =>
     typeof value === "string" && value.startsWith("ui://");
   return isUiUri(meta?.ui?.resourceUri) || isUiUri(meta?.["ui/resourceUri"]);
+}
+
+/**
+ * Whether a resource-read failure is an expected "the upstream server can't
+ * serve this" condition — method not found (-32601) or resource not found
+ * (-32002) — rather than a genuine platform fault. A third-party tool can
+ * advertise a `ui://` UI resource whose server never implemented
+ * `resources/read`; the client degrades to the plain tool result, so the
+ * gateway logs this quietly instead of at error level.
+ */
+function isUnavailableResourceError(error: unknown): boolean {
+  if (
+    error instanceof Error &&
+    /method not found|resource not found/i.test(error.message)
+  ) {
+    return true;
+  }
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = (error as { code?: unknown }).code;
+    return code === -32601 || code === -32002;
+  }
+  return false;
 }

@@ -34,6 +34,7 @@ import config, {
   parseLogFormat,
   parseMetricsPort,
   parseProcessType,
+  parseRefreshTokenReuseGraceSeconds,
   parseSampleRate,
   parseTrustProxy,
   parseVirtualKeyDefaultExpiration,
@@ -786,6 +787,31 @@ describe("getOtelExporterOtlpLogEndpoint", () => {
   });
 });
 
+describe("parseRefreshTokenReuseGraceSeconds", () => {
+  test("defaults to 60 when unset, empty, or whitespace", () => {
+    expect(parseRefreshTokenReuseGraceSeconds(undefined)).toBe(60);
+    expect(parseRefreshTokenReuseGraceSeconds("")).toBe(60);
+    expect(parseRefreshTokenReuseGraceSeconds("   ")).toBe(60);
+  });
+
+  test("parses a valid value and trims whitespace", () => {
+    expect(parseRefreshTokenReuseGraceSeconds("120")).toBe(120);
+    expect(parseRefreshTokenReuseGraceSeconds("  30  ")).toBe(30);
+  });
+
+  test("accepts 0 to disable the grace window", () => {
+    expect(parseRefreshTokenReuseGraceSeconds("0")).toBe(0);
+  });
+
+  test("returns default and warns for non-numeric or negative values", () => {
+    expect(parseRefreshTokenReuseGraceSeconds("abc")).toBe(60);
+    expect(parseRefreshTokenReuseGraceSeconds("-5")).toBe(60);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_AUTH_REFRESH_TOKEN_REUSE_GRACE_SECONDS value "-5", using default 60',
+    );
+  });
+});
+
 describe("parseContentMaxLength", () => {
   test("should return default 10000 when no value provided", () => {
     expect(parseContentMaxLength(undefined)).toBe(10_000);
@@ -1161,6 +1187,45 @@ describe("chat active run config", () => {
     const { default: cfg } = await import("./config");
 
     expect(cfg.chat.activeRun.stopPollIntervalMs).toBe(500);
+  });
+});
+
+describe("mcp gateway config", () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    vi.resetModules();
+    process.env = { ...originalEnv };
+    process.env.ARCHESTRA_DATABASE_URL =
+      "postgresql://archestra:pass@localhost:5432/archestra";
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  test("defaults the tool call timeout to 60s", async () => {
+    delete process.env.ARCHESTRA_MCP_GATEWAY_TOOL_CALL_TIMEOUT_MS;
+
+    const { default: cfg } = await import("./config");
+
+    expect(cfg.mcpGateway.toolCallTimeoutMs).toBe(60000);
+  });
+
+  test("reads the tool call timeout from the env var", async () => {
+    process.env.ARCHESTRA_MCP_GATEWAY_TOOL_CALL_TIMEOUT_MS = "300000";
+
+    const { default: cfg } = await import("./config");
+
+    expect(cfg.mcpGateway.toolCallTimeoutMs).toBe(300000);
+  });
+
+  test("falls back to the default for invalid values", async () => {
+    process.env.ARCHESTRA_MCP_GATEWAY_TOOL_CALL_TIMEOUT_MS = "-1";
+
+    const { default: cfg } = await import("./config");
+
+    expect(cfg.mcpGateway.toolCallTimeoutMs).toBe(60000);
   });
 });
 

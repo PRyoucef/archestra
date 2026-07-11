@@ -271,6 +271,10 @@ three tasks —
   updated in place (version advanced, not recreated), and ran the bundled script on both files, and
   that the submitted normalized rows match the recompute.
 
+`apps` exercises MCP App authoring with the built-in app tools and the synthetic `acme_it` MCP. It uses
+`share_backend = true` and includes `repo-docs-app`, `access-request-app`, `standup-notes-app`, and
+`keyboard-kanban-app`.
+
 ## Lifecycle: fresh backend over shared infra
 
 The harness does not run its own Tilt stack. It resolves a Dagger code-runtime engine (see the ladder
@@ -282,6 +286,17 @@ effect without a git worktree, a second Tilt, or any edit to `platform/.env`. Th
 second backend runs the already-built `dist/server.mjs` the main stack keeps fresh, so it never
 starts a competing `tsdown --watch`. Teardown always runs: the backend process group is killed and
 the benchmark database is dropped.
+
+**Spawning from a git branch (`--branch <ref>`).** To A/B a branch against the working tree, pass
+`--branch <ref>` (or `ARCHESTRA_BENCH_BACKEND_BRANCH`). The runner fetches `origin/<ref>`, checks the
+commit out into a throwaway git worktree, runs a full `pnpm install --frozen-lockfile` + `pnpm build`
+(so native `*.node` addons and `dist/server.mjs` come from the branch), and spawns every env's backend
+from it — one build per run, shared by all envs. Prereqs a fresh checkout lacks are sourced from the
+dev tree: `platform/.env` is copied in and `dev/bin/dagger` is symlinked when present (otherwise the
+worktree relies on `ARCHESTRA_CODE_RUNTIME_DAGGER_CLI_BIN`, same as the dev tree). The worktree is
+removed on normal completion and on SIGINT/SIGTERM; `config.json` records `backend_branch` /
+`backend_commit`. This is the slower opt-in path — it conflicts with `--platform-dir`, and the bench's
+own sidecars (Postgres/Dagger) still come from the harness checkout, not the branch.
 
 **Dagger host resolution.** Before booting the backend, the runner resolves a Dagger host and shares
 the first successful result across lanes (so they can't split across engines; a failed attempt isn't
@@ -329,8 +344,9 @@ Each (env, task, provider, model) cell resolves to exactly one outcome:
 
 ## Run
 
-The harness is a single Rust binary, `archestra-bench`, with three subcommands: `benchmark` (run the
-eval), `analyze` (turn a finished run into a recommendations report), and `full` (do both).
+The harness is a single Rust binary, `archestra-bench`, with five subcommands: `benchmark` (run the
+benchmark), `analyze` (turn a finished run into a recommendations report), `full` (do both), `prepare`
+(render a run manifest for external analysis), and `dashboard` (serve a local read-only dashboard).
 
 ```bash
 cargo build --release            # target/release/archestra-bench
@@ -347,6 +363,10 @@ archestra-bench analyze --run-dir experiments/<id> --map kimi --reduce glm
 
 # both at once: a fresh run, then its analysis
 archestra-bench full --env basic --lanes kimi --map kimi --reduce glm
+
+# prepare or browse finished runs without LLM calls
+archestra-bench prepare --run-dir experiments/<id>
+archestra-bench dashboard --experiments-dir experiments
 ```
 
 `--env` and `--task` each accept one name or a comma-separated list (default: all). A **lane** is a
